@@ -14,6 +14,7 @@ import multiprocessing
 from multiprocessing.process import BaseProcess
 import os
 from pathlib import Path
+import re
 import shlex
 from string import Template
 import subprocess
@@ -298,23 +299,45 @@ def runner_main(args: list[str]) -> int:
     ))
 
 
+def hugetlb_available() -> bool:
+    info = dict(line.split(":", 1) for line in Path("/proc/meminfo").read_text().splitlines())
+    return int(info.get("HugePages_Total", "0")) > 0
+
+
 def start_vm(options: argparse.Namespace, vm_id: int, shared_dir: Path,
-             guest_command: list[str]) -> subprocess.Popen[str]:
+             guest_command: list[str], *, hugetlb: bool) -> subprocess.Popen[str]:
     shared_dir = shared_dir.resolve()
     shared_dir.mkdir(parents=True, exist_ok=True)
+    # Convert RAM amount from <float> Gb to <int> Mb.
+    memory = f"{int(options.vm_memory * 1024)}M"
     # VNG sets up matching installed modules. The read-only host root also
     # exposes /boot and /usr/lib/modules, including vmlinux DWARF.
-    # Firmware options come from the user's VNG configuration.
     command = [
         "vng",
         "--run", str(Path(options.kernel).resolve()),
         "--user", "root",
         "--name", f"wprof-vm{vm_id}",
         "--cpus", str(options.vm_cpus),
-        "--memory", options.vm_memory,
+        "--memory", memory,
+        "--disable-microvm",
         "--cwd", str(Path.cwd()),
         "--rwdir", str(shared_dir),
     ]
+    # Use the same machine with and without hugepage backing.
+    qemu_opts = ["-machine", "q35"]
+    # Empyrical data shows that on (some?) hosts with huge pages pool
+    # VM boot is much faster (4x times) if `hugetlb=on` option is
+    # passed to QEMU.
+    if hugetlb:
+        # Unfortunately, VNG does not provide an option to pass
+        # `hugetlb` to QEMU.
+        # However, a `--numa` parameter suppresses VNG's automatic
+        # memory configuration and allows to configure memory device
+        # "manually". Use it here as a workaround: create a machine
+        # with a single NUMA node.
+        command.extend(["--numa", "0,memdev=mem"])
+        qemu_opts.extend(["-object", f"memory-backend-memfd,id=mem,size={memory},share=on,hugetlb=on"])
+    command.append("--qemu-opts=" + shlex.join(qemu_opts))
     # Make sure python environment is always mounted.
     command.extend(["--rodir", f"{sys.prefix}={sys.prefix}"])
     command.extend(["--exec", shlex.join(guest_command)])
@@ -348,6 +371,21 @@ async def wait_vm(process: subprocess.Popen[str], deadline: float, log: IO[str])
             process.returncode = 124
 
     await asyncio.to_thread(wait_and_kill)
+
+
+_hugetlb_warning_shown = False
+
+
+def maybe_show_hugetlb_warning(log_path: Path) -> None:
+    global _hugetlb_warning_shown
+    if _hugetlb_warning_shown:
+        return
+    with log_path.open() as log:
+        if any(re.search(r"qemu.*Cannot allocate memory", line) for line in log):
+            logging.error(
+                "QEMU could not allocate memory with hugetlb enabled; try --no-hugetlb (see %s)",
+                log_path)
+            _hugetlb_warning_shown = True
 
 
 def read_vm_report(path: Path, expected: list[str]) -> dict[str, Any]:
@@ -407,7 +445,8 @@ def run_tests_on_host(options: argparse.Namespace, shared_dir: Path) -> dict[str
     try:
         report = json.loads(report_path.read_text())
     except (OSError, ValueError) as err:
-        report = dict(collected=[], results=[], errors=[f"Cannot read runner report: {err}"], exitstatus=status or 1)
+        report = dict(collected=[], results=[], errors=[f"Cannot read runner report: {err}"],
+                      exitstatus=status if status != 0 else 1)
     return report
 
 
@@ -435,11 +474,12 @@ def run_tests_on_host(options: argparse.Namespace, shared_dir: Path) -> dict[str
 #
 #   vng --run /boot/vmlinuz-... --user root --name wprof-vm0 \
 #       --cpus 2 --memory 4G --rwdir /tmp/wprof-run \
+#       --disable-microvm --qemu-opts='-machine q35' \
 #       --rodir /tmp/wprof-venv=/tmp/wprof-venv \
 #       --exec '/tmp/wprof-venv/bin/python -B -u /work/wprof/test/selftests.py runner @/tmp/wprof-run/vm-0.args'
 def run_tests_in_vm(options: argparse.Namespace, shared_dir: Path) -> dict[str, Any]:
     status, collection = collect_tests(options, shared_dir / "collection.json")
-    if status:
+    if status != 0:
         return dict(collected=[],
                     results=[],
                     errors=[f"Test collection failed (exit status {status})"],
@@ -451,6 +491,7 @@ def run_tests_in_vm(options: argparse.Namespace, shared_dir: Path) -> dict[str, 
         logging.error("No tests matched the selection")
         return dict(collected=[], results=[], errors=[], exitstatus=5)
     batches = [node_ids[i::vm_count] for i in range(vm_count)]
+    hugetlb = not options.no_hugetlb and hugetlb_available()
     logging.info("Running %d tests in %d VMs; artifacts: %s",
                  len(node_ids), vm_count, shared_dir)
 
@@ -483,7 +524,7 @@ def run_tests_in_vm(options: argparse.Namespace, shared_dir: Path) -> dict[str, 
                     ]
                     log = cleanup.enter_context((shared_dir / f"vm-{vm_id}.log").open("w", buffering=1))
                     deadline = time.monotonic() + options.vm_timeout
-                    process = start_vm(options, vm_id, shared_dir, guest_command)
+                    process = start_vm(options, vm_id, shared_dir, guest_command, hugetlb=hugetlb)
                     vm_processes.append(process)
                     assert process.stdout is not None
                     stream = cleanup.enter_context(process.stdout)
@@ -498,14 +539,18 @@ def run_tests_in_vm(options: argparse.Namespace, shared_dir: Path) -> dict[str, 
     results: list[dict[str, Any]] = []
     errors: list[str] = []
     for vm_id, (tests, status) in enumerate(zip(batches, statuses)):
+        log_path = shared_dir / f"vm-{vm_id}.log"
         report = read_vm_report(shared_dir / f"report-vm{vm_id}.json", tests)
-        if (status or report["exitstatus"]) and not report["errors"] and not any(
+        if hugetlb and status != 0:
+            maybe_show_hugetlb_warning(log_path)
+        if (status != 0 or report["exitstatus"] != 0) and not report["errors"] and not any(
             result["outcome"] == "failed" for result in report["results"]
         ):
-            report["errors"].append(f"VM exited unsuccessfully; see {shared_dir / f'vm-{vm_id}.log'}")
+            report["errors"].append(f"VM exited unsuccessfully; see {log_path}")
         results.extend(report["results"])
         errors.extend(f"VM {vm_id}: {error}" for error in report["errors"])
-    status = int(any(statuses) or bool(errors) or any(result["outcome"] == "failed" for result in results))
+    status = int(any(status != 0 for status in statuses) or bool(errors) or
+                 any(result["outcome"] == "failed" for result in results))
     return dict(collected=node_ids, results=results, errors=errors, exitstatus=status)
 
 
@@ -523,14 +568,16 @@ def launcher_main(args: list[str]) -> int:
     parser.add_argument("--vms", type=int, default=1, help="maximum parallel VMs (default: 1)")
     parser.add_argument("--kernel", default=f"/boot/vmlinuz-{os.uname().release}", help="guest kernel image")
     parser.add_argument("--vm-cpus", type=int, default=2, help="CPUs per VM (default: 2)")
-    parser.add_argument("--vm-memory", default="4G", help="memory per VM (default: 4G)")
+    parser.add_argument("--vm-memory", type=float, default=4.0, help="memory per VM in GiB (default: 4)")
+    parser.add_argument("--no-hugetlb", action="store_true", help="disable hugepage backing for guest RAM")
     parser.add_argument("--vm-timeout", type=float, default=300, help="seconds per VM, including boot (default: 300)")
     parser.add_argument("--report-json", type=Path, help="write results as JSON (default: <output directory>/report.json)")
     parser.add_argument("-v", "--verbose", action="count", default=0, help="show commands and verbose test output")
     options = parser.parse_intermixed_args(args)
-    if not options.no_vm and (options.vms < 1 or options.vm_cpus < 1 or options.vm_timeout <= 0):
-        parser.error("--vms, --vm-cpus and --vm-timeout must be positive")
-    logging.basicConfig(level=logging.INFO if options.verbose else logging.WARNING, format="%(message)s")
+    if not options.no_vm and (options.vms < 1 or options.vm_cpus < 1 or
+                              options.vm_memory <= 0 or options.vm_timeout <= 0):
+        parser.error("--vms, --vm-cpus, --vm-memory and --vm-timeout must be positive")
+    logging.basicConfig(level=logging.INFO if options.verbose > 0 else logging.WARNING, format="%(message)s")
 
     shared_dir = Path(mkdtemp(prefix="wprof-selftests-", dir="/tmp")).resolve()
     destination = options.report_json.resolve() if options.report_json else shared_dir / "report.json"
