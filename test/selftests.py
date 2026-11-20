@@ -30,6 +30,10 @@ import pytest
 K = TypeVar("K", bound=Hashable)
 
 
+def verbose() -> bool:
+    return logging.getLogger().isEnabledFor(logging.INFO)
+
+
 def privileged(command):
     return command if os.geteuid() == 0 else ["sudo", "-n", *command]
 
@@ -178,6 +182,20 @@ class ProgressReport:
     def __init__(self) -> None:
         # Pytest reports each phase separately; retain failures and skips until teardown.
         self.outcomes: dict[str, str] = {}
+        self.durations: defaultdict[str, float] = defaultdict(float)
+        self.boot_uptime: float | None = None
+
+    @pytest.hookimpl(tryfirst=True)
+    def pytest_sessionstart(self, session: pytest.Session) -> None:
+        self.session_start = time.monotonic()
+        # Pytest restores logging levels before our session footer runs.
+        self.show_timings = verbose()
+        if not session.config.option.collectonly:
+            session.config.option.verbose = -2
+
+    def pytest_runtest_logstart(self, nodeid, location) -> None:
+        if self.boot_uptime is None:
+            self.boot_uptime = time.clock_gettime(time.CLOCK_BOOTTIME)
 
     @pytest.hookimpl(wrapper=True)
     def pytest_report_teststatus(self, report, config):
@@ -187,6 +205,7 @@ class ProgressReport:
 
     @pytest.hookimpl(trylast=True)
     def pytest_runtest_logreport(self, report: pytest.TestReport) -> None:
+        self.durations[report.nodeid] += report.duration
         # A passing teardown must not hide an earlier failure.
         if report.failed:
             self.outcomes[report.nodeid] = "failed"
@@ -196,7 +215,23 @@ class ProgressReport:
         if report.when == "teardown":
             label = f"{report.nodeid}:"
             outcome = self.outcomes.pop(report.nodeid, "passed")
-            print(f"{label:<{79 - len(outcome)}} {outcome}", flush=True)
+            duration = self.durations.pop(report.nodeid)
+            timing = f" {duration:7.2f}s" if self.show_timings else ""
+            print(f"{label:<{79 - len(outcome)}} {outcome}{timing}", flush=True)
+
+    @pytest.hookimpl(wrapper=True, tryfirst=True)
+    def pytest_sessionfinish(self, session: pytest.Session):
+        if not session.config.option.collectonly:
+            # Live logging may have increased verbosity during the run.
+            session.config.option.verbose = -2
+
+        result = yield
+
+        if self.show_timings and not session.config.option.collectonly:
+            elapsed = time.monotonic() - self.session_start
+            booted = f"{self.boot_uptime:.2f}s" if self.boot_uptime is not None else "n/a"
+            print(f"{session.testscollected} tests, done in {elapsed:.2f}s (boot {booted})", flush=True)
+        return result
 
 
 def pytest_addoption(parser):
@@ -357,7 +392,8 @@ def start_vm(options: argparse.Namespace, vm_id: int, shared_dir: Path,
 async def log_monitor(stream: IO[str], log: IO[str], prefix: str) -> None:
     while line := await asyncio.to_thread(stream.readline):
         log.write(line)
-        print(prefix + line.rstrip("\n"), flush=True)
+        if line.strip():
+            print(prefix + line.rstrip("\n"), flush=True)
 
 
 async def wait_vm(process: subprocess.Popen[str], deadline: float, log: IO[str]) -> None:
@@ -421,7 +457,10 @@ def collect_tests(options: argparse.Namespace, collection_path: Path) -> tuple[i
         command.extend(["-k", options.keyword])
     if options.markexpr:
         command.extend(["-m", options.markexpr])
-    status = subprocess.call(command)
+    result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    status = result.returncode
+    if verbose() or status not in (0, pytest.ExitCode.NO_TESTS_COLLECTED):
+        print(result.stdout, end="")
     if status not in (0, pytest.ExitCode.NO_TESTS_COLLECTED):
         return status, {}
     try:
@@ -555,6 +594,7 @@ def run_tests_in_vm(options: argparse.Namespace, shared_dir: Path) -> dict[str, 
 
 
 def launcher_main(args: list[str]) -> int:
+    start = time.monotonic()
     parser = argparse.ArgumentParser(
         prog="selftests.py launcher", allow_abbrev=False,
         description="Run selected tests in virtme-ng guests or on the host.",
@@ -590,8 +630,10 @@ def launcher_main(args: list[str]) -> int:
     destination.write_text(json.dumps(report, indent=2) + "\n")
     counts = {outcome: sum(r["complete"] and r["outcome"] == outcome for r in report["results"])
               for outcome in ("passed", "failed", "skipped")}
-    print(f"{counts['passed']} passed, {counts['failed']} failed, {counts['skipped']} skipped; "
-          f"{len(report['errors'])} infrastructure errors. Report: {destination}")
+    elapsed = time.monotonic() - start
+    print(f"{counts['passed']} passed, {counts['failed']} failed, {counts['skipped']} skipped, "
+          f"{len(report['errors'])} infrastructure errors, elapsed time: {elapsed:.2f}s.")
+    print(f"Report: {destination}")
     for error in report["errors"]:
         logging.error("%s", error)
     return int(report["exitstatus"])
