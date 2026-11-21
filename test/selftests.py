@@ -1,30 +1,29 @@
 #!/usr/bin/env python3
 """Kernel test harness and pytest driver."""
 from collections import defaultdict
-from contextlib import ExitStack
-from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Callable, Hashable, Iterator
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
 from dataclasses import dataclass
 from functools import cached_property
+from multiprocessing.process import BaseProcess
+from pathlib import Path
+from string import Template
+from tempfile import NamedTemporaryFile, mkdtemp
+from types import SimpleNamespace
+from typing import Any, IO, TypeVar
 import argparse
 import asyncio
 import json
 import logging
 import multiprocessing
-from multiprocessing.process import BaseProcess
 import os
-from pathlib import Path
+import pytest
 import re
 import shlex
-from string import Template
 import subprocess
 import sys
-from tempfile import NamedTemporaryFile, mkdtemp
 import time
-from types import SimpleNamespace
-from typing import Any, IO, TypeVar
-
-import pytest
 
 
 K = TypeVar("K", bound=Hashable)
@@ -373,6 +372,8 @@ def start_vm(options: argparse.Namespace, vm_id: int, shared_dir: Path,
         command.extend(["--numa", "0,memdev=mem"])
         qemu_opts.extend(["-object", f"memory-backend-memfd,id=mem,size={memory},share=on,hugetlb=on"])
     command.append("--qemu-opts=" + shlex.join(qemu_opts))
+    if options.ssh:
+        command.extend(["--ssh", str(options.ssh), "--ssh-tcp"])
     # Make sure python environment is always mounted.
     command.extend(["--rodir", f"{sys.prefix}={sys.prefix}"])
     command.extend(["--exec", shlex.join(guest_command)])
@@ -399,7 +400,8 @@ async def log_monitor(stream: IO[str], log: IO[str], prefix: str) -> None:
 async def wait_vm(process: subprocess.Popen[str], deadline: float, log: IO[str]) -> None:
     def wait_and_kill() -> None:
         try:
-            process.wait(timeout=max(0, deadline - time.monotonic()))
+            timeout = None if deadline == 0 else max(0, deadline - time.monotonic())
+            process.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
             logging.error("VM killed after a timeout, see %s", log.name)
             kill(process, as_root=False)
@@ -489,6 +491,31 @@ def run_tests_on_host(options: argparse.Namespace, shared_dir: Path) -> dict[str
     return report
 
 
+def prepare_ssh_guest(shared_dir: Path, guest_command: list[str], ssh: int) -> list[str]:
+    script = shared_dir / "run-selftests.sh"
+    script.write_text(
+        "#!/bin/sh\n"
+        "set -e\n"
+        f"cd {shlex.quote(str(Path.cwd()))}\n"
+        f"exec {shlex.join(guest_command)}\n"
+    )
+
+    # Copy into guest-local /tmp so the script can be edited during the session.
+    setup = shared_dir / "ssh-setup.sh"
+    setup.write_text(
+        "set -e\n"
+        f"cp {shlex.quote(str(script))} /tmp/run-selftests.sh\n"
+        "chmod +x /tmp/run-selftests.sh\n"
+        "echo 'VM started, to connect:'\n"
+        f"echo '  vng --ssh-client {ssh} --ssh-tcp'\n"
+        f"echo '  ssh -F ~/.cache/virtme-ng/.ssh/virtme-ng-ssh.conf -p {ssh} virtme-ng'\n"
+        "echo 'To execute the tests, run /tmp/run-selftests.sh inside the guest.'\n"
+        "echo 'Press Ctrl-C in the launcher terminal to stop the VM.'\n"
+        "exec sleep infinity\n"
+    )
+    return ["/bin/sh", str(setup)]
+
+
 # File system mapping host -> guest:
 # - / -> /, read-only.
 # - /tmp/wprof-run -> /tmp/wprof-run: read/write:
@@ -561,8 +588,10 @@ def run_tests_in_vm(options: argparse.Namespace, shared_dir: Path) -> dict[str, 
                         sys.executable, "-B", "-u",
                         str(Path(__file__).resolve()), "runner", f"@{args_file}",
                     ]
+                    if options.ssh:
+                        guest_command = prepare_ssh_guest(shared_dir, guest_command, options.ssh)
                     log = cleanup.enter_context((shared_dir / f"vm-{vm_id}.log").open("w", buffering=1))
-                    deadline = time.monotonic() + options.vm_timeout
+                    deadline = 0 if options.ssh else time.monotonic() + options.vm_timeout
                     process = start_vm(options, vm_id, shared_dir, guest_command, hugetlb=hugetlb)
                     vm_processes.append(process)
                     assert process.stdout is not None
@@ -579,7 +608,12 @@ def run_tests_in_vm(options: argparse.Namespace, shared_dir: Path) -> dict[str, 
     errors: list[str] = []
     for vm_id, (tests, status) in enumerate(zip(batches, statuses)):
         log_path = shared_dir / f"vm-{vm_id}.log"
-        report = read_vm_report(shared_dir / f"report-vm{vm_id}.json", tests)
+        report_path = shared_dir / f"report-vm{vm_id}.json"
+        if options.ssh and not report_path.exists():
+            # An SSH session may end without running the tests.
+            report: dict[str, Any] = dict(results=[], errors=[], exitstatus=0)
+        else:
+            report = read_vm_report(report_path, tests)
         if hugetlb and status != 0:
             maybe_show_hugetlb_warning(log_path)
         if (status != 0 or report["exitstatus"] != 0) and not report["errors"] and not any(
@@ -605,6 +639,8 @@ def launcher_main(args: list[str]) -> int:
     parser.add_argument("--wprof", type=Path, default=Path(__file__).resolve().parent.parent / "src/wprof",
                         help="wprof binary to test (default: src/wprof)")
     parser.add_argument("--no-vm", action="store_true", help="run tests on the host instead of starting VMs")
+    parser.add_argument("--ssh", nargs="?", type=int, const=2222, metavar="N",
+                        help="prepare one VM for manual testing over SSH (default: 2222); disable VM timeout")
     parser.add_argument("--vms", type=int, default=1, help="maximum parallel VMs (default: 1)")
     parser.add_argument("--kernel", default=f"/boot/vmlinuz-{os.uname().release}", help="guest kernel image")
     parser.add_argument("--vm-cpus", type=int, default=2, help="CPUs per VM (default: 2)")
@@ -614,6 +650,12 @@ def launcher_main(args: list[str]) -> int:
     parser.add_argument("--report-json", type=Path, help="write results as JSON (default: <output directory>/report.json)")
     parser.add_argument("-v", "--verbose", action="count", default=0, help="show commands and verbose test output")
     options = parser.parse_intermixed_args(args)
+    if options.ssh is not None:
+        if not 1 <= options.ssh <= 65535:
+            parser.error("--ssh must be a TCP port between 1 and 65535")
+        if options.no_vm:
+            parser.error("--ssh cannot be combined with --no-vm")
+        options.vms = 1
     if not options.no_vm and (options.vms < 1 or options.vm_cpus < 1 or
                               options.vm_memory <= 0 or options.vm_timeout <= 0):
         parser.error("--vms, --vm-cpus, --vm-memory and --vm-timeout must be positive")
@@ -645,4 +687,9 @@ if __name__ == "__main__":
     parser.add_argument("args", nargs=argparse.REMAINDER)
     arguments = parser.parse_args()
     entry = runner_main if arguments.command == "runner" else launcher_main
-    raise SystemExit(entry(arguments.args))
+    try:
+        status = entry(arguments.args)
+    except KeyboardInterrupt:
+        # Cleanup has unwound; suppress the traceback and use the conventional Ctrl-C status.
+        status = 130
+    raise SystemExit(status)
