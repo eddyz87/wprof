@@ -1,30 +1,32 @@
 #!/usr/bin/env python3
-"""Kernel test harness and pytest driver."""
+"""Kernel test harness using only the Python standard library."""
 from collections import defaultdict
-from collections.abc import Callable, Hashable, Iterator
+from collections.abc import Callable, Hashable
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import ExitStack
-from dataclasses import dataclass
+from contextlib import ExitStack, chdir, contextmanager
+from dataclasses import asdict, dataclass, field
 from fnmatch import fnmatchcase
 from functools import cached_property
 from multiprocessing.process import BaseProcess
 from pathlib import Path
 from string import Template
-from tempfile import NamedTemporaryFile, mkdtemp
+from tempfile import NamedTemporaryFile, TemporaryDirectory, mkdtemp
 from types import SimpleNamespace
 from typing import Any, IO, TypeVar
 import argparse
 import asyncio
+import importlib.util
+import inspect
 import json
 import logging
 import multiprocessing
 import os
-import pytest
 import re
 import shlex
 import subprocess
 import sys
 import time
+import traceback
 
 
 K = TypeVar("K", bound=Hashable)
@@ -112,19 +114,60 @@ class Artifacts:
         return JsonTrace(self.directory / "trace.json")
 
 
-@dataclass
-class Sh:
-    fork: Callable[..., BaseProcess]
-    shell: Callable[..., subprocess.Popen[Any]]
-    wprof: Callable[..., tuple[subprocess.Popen[bytes], Artifacts]]
+class Sh(ExitStack):
+    def __init__(self, directory: Path, binary: Path):
+        super().__init__()
+        self.directory = directory
+        self.binary = binary
+        self.count = 0
 
+    def tempfile(self, **kwargs):
+        kwargs.setdefault("dir", "/tmp")
+        return self.enter_context(NamedTemporaryFile(**kwargs))
 
-# Translate from pytest NodeID to <basename>/<function> naming format.
-# E.g. test/cases/utrace.py::test_vfs_write_wrong_directory ->
-#      utrace/test_vfs_write_wrong_directory
-def short_test_name(nodeid: str) -> str:
-    path, _, selector = nodeid.partition("::")
-    return f"{Path(path).stem}/{selector}"
+    def tempdir(self, **kwargs) -> Path:
+        kwargs.setdefault("dir", "/tmp")
+        return Path(self.enter_context(TemporaryDirectory(**kwargs)))
+
+    def fork(self, function: Callable[..., object], *args: Any, **kwargs: Any) -> BaseProcess:
+        # Fork preserves local functions and inherited sockets.
+        process = multiprocessing.get_context("fork").Process(target=function, args=args, kwargs=kwargs)
+        process.start()
+        self.callback(kill, process)
+        return process
+
+    def shell(self, command: str, **kwargs: Any) -> subprocess.Popen[Any]:
+        logging.info("Command: %s", command)
+        process = subprocess.Popen(command, shell=True, start_new_session=True, **kwargs)
+        self.callback(kill, process)
+        return process
+
+    def wprof(self, parameters: str, **substitutions: object) -> tuple[subprocess.Popen[bytes], Artifacts]:
+        self.count += 1
+        directory = self.directory / f"capture-{self.count}"
+        directory.mkdir()
+        # Put wprof's raw output in /tmp. Can't use `directory`
+        # because wprof memory maps the output file, while VM
+        # runners mount the `directory` via 9p protocol and mmap
+        # is not available.
+        recording = self.enter_context(NamedTemporaryFile(
+            dir="/tmp",
+            prefix=f"wprof-{self.directory.name}-{self.count}-",
+            suffix=".data",
+        ))
+        json_path = directory / "trace.json"
+        # Touch json file before wprof creates it, such that user
+        # running the tests owns it, not the root.
+        json_path.touch()
+        values = {**substitutions, "data": recording.name, "json": json_path}
+        # Substitute after tokenization so spaces and shell metacharacters
+        # in values stay inside one argument.
+        args = [Template(arg).substitute(values) for arg in shlex.split(parameters)]
+        command = "exec " + shlex.join(privileged([str(self.binary), *args]))
+        logging.info("Capture directory: %s", directory)
+        with (directory / "stdout.log").open("w") as stdout, (directory / "stderr.log").open("w") as stderr:
+            process = self.shell(command, stdout=stdout, stderr=stderr)
+        return process, Artifacts(directory)
 
 
 def match_test_name(name: str, pattern: str) -> bool:
@@ -135,224 +178,179 @@ def match_test_name(name: str, pattern: str) -> bool:
     )
 
 
-def absolute_nodeid(item: pytest.Item) -> str:
-    # Make the file path absolute while preserving the selector,
-    # including any parametrized test ID.
-    _, separator, selector = item.nodeid.partition("::")
-    return f"{item.path}{separator}{selector}"
+@contextmanager
+def capture_output(directory: Path):
+    # Capture OS descriptors as well as Python prints, including inherited child output.
+    with ExitStack() as cleanup:
+        sys.stdout.flush()
+        sys.stderr.flush()
+        for fd, name in ((1, "stdout.log"), (2, "stderr.log")):
+            stream = cleanup.enter_context((directory / name).open("w"))
+            saved = os.dup(fd)
+            cleanup.callback(os.close, saved)
+            cleanup.callback(os.dup2, saved, fd)
+            os.dup2(stream.fileno(), fd)
+        try:
+            yield
+        finally:
+            sys.stdout.flush()
+            sys.stderr.flush()
 
 
-# Save completed tests as we go; exitstatus stays null until the session finishes.
-class JsonReport:
-    def __init__(self, path: Path) -> None:
+def load_case_modules():
+    for path in sorted((Path(__file__).resolve().parent / "cases").glob("*.py")):
+        if path.name.startswith("_"):
+            continue
+        name = f"_wprof_case_{path.stem}"
+        if name not in sys.modules:
+            spec = importlib.util.spec_from_file_location(name, path)
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[name] = module
+            spec.loader.exec_module(module)
+
+
+@dataclass
+class TestResult:
+    name: str
+    artifacts: str
+    outcome: str = "passed"
+    duration: float = 0.0
+    complete: bool = False
+    details: list[str] = field(default_factory=list)
+
+
+@dataclass
+class ReportData:
+    collected: list[str] = field(default_factory=list)
+    results: list[TestResult] = field(default_factory=list)
+    errors: list[str] = field(default_factory=list)
+    exitstatus: int | None = None
+
+
+def read_report(path: Path) -> ReportData:
+    data = json.loads(path.read_text())
+    data["results"] = [TestResult(**result) for result in data["results"]]
+    return ReportData(**data)
+
+
+# Save progress as we go; exitstatus stays null until the session finishes.
+class RunReport:
+    def __init__(self, path: Path | None):
         self.path = path
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.collected: list[dict[str, str]] = []
-        self.results: dict[str, dict[str, Any]] = {}
-        self.errors: list[str] = []
-        self.exitstatus: int | None = None
+        self.data = ReportData()
+        self.start = time.monotonic()
+        self.boot_uptime = None
 
-    def write(self) -> None:
-        report = dict(collected=self.collected, results=list(self.results.values()),
-                      errors=self.errors, exitstatus=self.exitstatus)
-        self.path.write_text(json.dumps(report, indent=2) + "\n")
+    def write(self):
+        if self.path:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.path.write_text(json.dumps(asdict(self.data), indent=2) + "\n")
 
-    def pytest_collection_finish(self, session: pytest.Session) -> None:
-        node_ids = dict.fromkeys(absolute_nodeid(item) for item in session.items)
-        self.collected = [
-            dict(nodeid=nodeid, name=short_test_name(nodeid))
-            for nodeid in node_ids
-        ]
-        self.write()
-
-    def pytest_collectreport(self, report: pytest.CollectReport) -> None:
-        if report.failed:
-            self.errors.append(report.longreprtext)
-
-    @pytest.hookimpl(wrapper=True, tryfirst=True)
-    def pytest_runtest_makereport(self, item, call):
-        report = yield
-        nodeid = absolute_nodeid(item)
-        result = self.results.setdefault(nodeid, dict(
-            nodeid=nodeid, name=short_test_name(nodeid),
-            outcome="passed", duration=0.0, complete=False, details=[],
-        ))
-        # Keep pytest's durations and combine setup, call, and teardown into
-        # one result. A passing teardown must not hide an earlier failure.
-        result["duration"] += report.duration
-        if report.failed:
-            result["outcome"] = "failed"
-        elif report.skipped and result["outcome"] == "passed":
-            result["outcome"] = "skipped"
-        if report.failed or report.skipped:
-            result["details"].append(dict(phase=report.when, message=report.longreprtext))
-        if report.when == "teardown":
-            result["complete"] = True
-            self.write()
-        return report
-
-    def pytest_sessionfinish(self, session: pytest.Session, exitstatus: int) -> None:
-        self.exitstatus = int(exitstatus)
-        self.write()
-
-    def pytest_internalerror(self, excrepr) -> None:
-        self.errors.append(str(excrepr))
-
-
-class ProgressReport:
-    def __init__(self) -> None:
-        # Pytest reports each phase separately; retain failures and skips until teardown.
-        self.outcomes: dict[str, str] = {}
-        self.durations: defaultdict[str, float] = defaultdict(float)
-        self.boot_uptime: float | None = None
-
-    @pytest.hookimpl(tryfirst=True)
-    def pytest_sessionstart(self, session: pytest.Session) -> None:
-        self.session_start = time.monotonic()
-        # Pytest restores logging levels before our session footer runs.
-        self.show_timings = verbose()
-        if not session.config.option.collectonly:
-            session.config.option.verbose = -2
-
-    def pytest_runtest_logstart(self, nodeid, location) -> None:
+    def begin(self, name: str, directory: Path) -> TestResult:
         if self.boot_uptime is None:
             self.boot_uptime = time.clock_gettime(time.CLOCK_BOOTTIME)
+        self.test_start = time.monotonic()
+        record = TestResult(name=name, artifacts=str(directory))
+        self.data.results.append(record)
+        # Leave an incomplete record if the process or VM dies during this test.
+        self.write()
+        return record
 
-    @pytest.hookimpl(wrapper=True)
-    def pytest_report_teststatus(self, report, config):
-        # Keep pytest's categories and summary labels, but suppress progress characters.
-        category, _, word = yield
-        return category, "", word
+    def end(self, record: TestResult) -> None:
+        record.duration = time.monotonic() - self.test_start
+        record.complete = True
+        self.write()
+        label, outcome = record.name + ":", record.outcome
+        timing = f" {record.duration:7.2f}s" if verbose() else ""
+        print(f"{label:<{79 - len(outcome)}} {outcome}{timing}", flush=True)
+        if outcome == "failed":
+            for message in record.details:
+                print(message, flush=True)
+        if outcome == "failed" or verbose():
+            for name in ("stdout.log", "stderr.log"):
+                path = Path(record.artifacts) / name
+                if path.exists() and path.stat().st_size:
+                    print(f"Captured {name} ({path}):\n{path.read_text()}", flush=True)
 
-    @pytest.hookimpl(trylast=True)
-    def pytest_runtest_logreport(self, report: pytest.TestReport) -> None:
-        self.durations[report.nodeid] += report.duration
-        # A passing teardown must not hide an earlier failure.
-        if report.failed:
-            self.outcomes[report.nodeid] = "failed"
-        elif report.skipped:
-            self.outcomes.setdefault(report.nodeid, "skipped")
-
-        if report.when == "teardown":
-            label = f"{short_test_name(report.nodeid)}:"
-            outcome = self.outcomes.pop(report.nodeid, "passed")
-            duration = self.durations.pop(report.nodeid)
-            timing = f" {duration:7.2f}s" if self.show_timings else ""
-            print(f"{label:<{79 - len(outcome)}} {outcome}{timing}", flush=True)
-
-    @pytest.hookimpl(wrapper=True, tryfirst=True)
-    def pytest_sessionfinish(self, session: pytest.Session):
-        if not session.config.option.collectonly:
-            # Live logging may have increased verbosity during the run.
-            session.config.option.verbose = -2
-
-        result = yield
-
-        if self.show_timings and not session.config.option.collectonly:
-            elapsed = time.monotonic() - self.session_start
-            booted = f"{self.boot_uptime:.2f}s" if self.boot_uptime is not None else "n/a"
-            print(f"{session.testscollected} tests, done in {elapsed:.2f}s (boot {booted})", flush=True)
-        return result
-
-
-def pytest_addoption(parser):
-    parser.addoption("--wprof", default=str(Path(__file__).resolve().parent.parent / "src/wprof"),
-                     help="wprof binary to test (default: src/wprof)")
-    parser.addoption("--report-json", type=Path, help="write test collection and results as JSON")
-
-
-@pytest.hookimpl(tryfirst=True)
-def pytest_configure(config):
-    config.pluginmanager.register(ProgressReport(), "wprof-progress")
-    if config.option.report_json:
-        config.pluginmanager.register(JsonReport(config.option.report_json.resolve()), "wprof-json-report")
-    if (config.option.verbose > 0 and config.option.log_cli_level is None and
-        config.getini("log_cli_level") in (None, "")):
-        config.option.log_cli_level = "INFO"
-    config.addinivalue_line("python_files", "*.py")
-    config.addinivalue_line("markers", "utrace: kernel utrace tests")
-
-
-@pytest.hookimpl(wrapper=True)
-def pytest_cmdline_main(config):
-    result = yield
-    if config.option.help:
-        print("\nwprof selftests:\n"
-              "  Use -v (or --log-cli-level=INFO) to show commands and capture\n"
-              "  directories while tests run.\n"
-              "  An explicit log level takes precedence.")
-    return result
-
-
-@pytest.fixture(scope="session")
-def wprof_binary(pytestconfig, tmp_path_factory):
-    binary = Path(pytestconfig.getoption("--wprof")).resolve()
-    directory = tmp_path_factory.mktemp("wprof-schema")
-    schema = subprocess.check_output([str(binary), "--json-schema"], text=True, timeout=10)
-    (directory / "json-schema.md").write_text(schema)
-    return binary
-
-
-@pytest.fixture
-def sh(tmp_path: Path, wprof_binary: Path) -> Iterator[Sh]:
-    with ExitStack() as cleanup:
-        count = 0
-
-        def fork(function: Callable[..., object], *args: Any, **kwargs: Any) -> BaseProcess:
-            # Fork preserves local functions and sockets inherited from fixtures.
-            process = multiprocessing.get_context("fork").Process(target=function, args=args, kwargs=kwargs)
-            process.start()
-            cleanup.callback(kill, process)
-            return process
-
-        def shell(command: str, **kwargs: Any) -> subprocess.Popen[Any]:
-            logging.info("Command: %s", command)
-            process = subprocess.Popen(command, shell=True, start_new_session=True, **kwargs)
-            cleanup.callback(kill, process)
-            return process
-
-        def wprof(parameters: str, **substitutions: object) -> tuple[subprocess.Popen[bytes], Artifacts]:
-            nonlocal count
-            count += 1
-            directory = tmp_path / f"capture-{count}"
-            directory.mkdir()
-            # Put wprof's raw output in /tmp. Can't use `directory`
-            # because wprof memory maps the output file, while VM
-            # runners mount the `directory` via 9p protocol and mmap
-            # is not available.
-            recording = cleanup.enter_context(NamedTemporaryFile(
-                dir="/tmp",
-                prefix=f"wprof-{tmp_path.name}-{count}-",
-                suffix=".data",
-            ))
-            json_path = directory / "trace.json"
-            # Touch json file before wprof creates it, such that user
-            # running the tests owns it, not the root.
-            json_path.touch()
-            values = {**substitutions, "data": recording.name, "json": json_path}
-            # Substitute after tokenization so spaces and shell metacharacters
-            # in values stay inside one argument.
-            args = [Template(arg).substitute(values) for arg in shlex.split(parameters)]
-            command = "exec " + shlex.join(privileged([str(wprof_binary), *args]))
-            logging.info("Capture directory: %s", directory)
-            with (directory / "stdout.log").open("w") as stdout, (directory / "stderr.log").open("w") as stderr:
-                process = shell(command, stdout=stdout, stderr=stderr)
-            return process, Artifacts(directory)
-
-        yield Sh(fork=fork, shell=shell, wprof=wprof)
+    def finish(self, status):
+        self.data.exitstatus = status
+        self.write()
+        if verbose():
+            boot = f"{self.boot_uptime:.2f}s" if self.boot_uptime is not None else "n/a"
+            print(f"{len(self.data.results)} tests, done in {time.monotonic() - self.start:.2f}s (boot {boot})")
+        return status
 
 
 def runner_main(args: list[str]) -> int:
-    # -o overrides a pytest configuration option. testpaths supplies the default
-    # discovery directory; explicit file paths or node IDs take precedence.
-    # Disable XML and cache output, including when options come from an @file.
-    return int(pytest.main(
-        ["-o", f"testpaths={Path(__file__).resolve().parent / 'cases'}", *args,
-         # Our reporter handles progress; retain pytest's failure diagnostics.
-         "-o", "verbosity_test_cases=-1", "-o", "console_output_style=classic",
-         "-p", "no:junitxml", "-p", "no:cacheprovider"],
-        plugins=[sys.modules[__name__]],
-    ))
+    parser = argparse.ArgumentParser(prog="selftests.py --runner", fromfile_prefix_chars="@")
+    parser.add_argument("tests", nargs="*")
+    parser.add_argument("--report-json", type=Path)
+    parser.add_argument("--basetemp", type=Path)
+    parser.add_argument("--wprof", type=Path, default=Path(__file__).resolve().parent.parent / "src/wprof")
+    parser.add_argument("-v", "--verbose", action="count", default=0)
+    options = parser.parse_args(args)
+    logging.basicConfig(level=logging.INFO if options.verbose else logging.WARNING, format="%(message)s")
+    report = RunReport(options.report_json.resolve() if options.report_json else None)
+    try:
+        load_case_modules()
+        selected = options.tests or list(TESTS)
+        for name in selected:
+            if name not in TESTS:
+                raise ValueError(f"Unknown test: {name}")
+    except Exception:
+        message = traceback.format_exc()
+        print(message, file=sys.stderr)
+        report.data.errors.append(message)
+        return report.finish(1)
+    report.data.collected = selected
+    report.write()
+    if not selected:
+        return report.finish(5)
+    binary = options.wprof.resolve()
+    base = options.basetemp.resolve() if options.basetemp else Path(mkdtemp(prefix="wprof-runner-"))
+    base.mkdir(parents=True, exist_ok=True)
+    try:
+        run_selected(selected, binary, base, report)
+    except Exception:
+        message = traceback.format_exc()
+        print(message, file=sys.stderr)
+        report.data.errors.append(message)
+    failed = report.data.errors or any(r.outcome == "failed" for r in report.data.results)
+    return report.finish(int(bool(failed)))
+
+
+TESTS: dict[str, Callable[[Sh], None]] = {}
+
+
+def test(function: Callable[[Sh], None]):
+    TESTS[test_name(function)] = function
+    return function
+
+
+class SkipTest(Exception):
+    pass
+
+
+def test_name(function: Callable[[Sh], None]) -> str:
+    path = Path(inspect.getfile(function))
+    return f"{path.stem}/{function.__name__}"
+
+
+def run_selected(tests, binary, base, report):
+    for name in tests:
+        directory = Path(mkdtemp(prefix=name.replace("/", "-") + "-", dir=base))
+        record = report.begin(name, directory)
+        try:
+            with capture_output(directory), chdir(directory), Sh(directory, binary) as sh:
+                TESTS[name](sh)
+        except SkipTest as err:
+            record.outcome = "skipped"
+            record.details.append(str(err))
+        except Exception:
+            # A cleanup failure also fails the test; chained tracebacks retain the body failure.
+            record.outcome = "failed"
+            record.details.append(traceback.format_exc())
+        report.end(record)
 
 
 def hugetlb_available() -> bool:
@@ -448,64 +446,49 @@ def maybe_show_hugetlb_warning(log_path: Path) -> None:
             _hugetlb_warning_shown = True
 
 
-def read_vm_report(path: Path, expected: list[str]) -> dict[str, Any]:
+def read_vm_report(path: Path, expected: list[str]) -> ReportData:
     try:
-        report = json.loads(path.read_text())
-        results = report["results"]
-        ids = [result["nodeid"] for result in results]
-        completed = {result["nodeid"] for result in results if result["complete"] is True}
-        if not isinstance(report["errors"], list) or any(not isinstance(e, str) for e in report["errors"]):
+        report = read_report(path)
+        results = report.results
+        names = [result.name for result in results]
+        completed = {result.name for result in results if result.complete is True}
+        if not isinstance(report.errors, list) or any(not isinstance(e, str) for e in report.errors):
             raise ValueError("invalid errors list")
-        if any(result["outcome"] not in ("passed", "failed", "skipped") for result in results):
+        if any(result.outcome not in ("passed", "failed", "skipped") for result in results):
             raise ValueError("invalid test outcome")
-        if len(ids) != len(set(ids)) or set(ids) - set(expected):
-            raise ValueError("duplicate or unexpected test IDs")
+        if len(names) != len(set(names)) or set(names) - set(expected):
+            raise ValueError("duplicate or unexpected test names")
         missing = set(expected) - completed
         if missing:
-            report["errors"].append("unfinished tests: " + ", ".join(sorted(map(short_test_name, missing))))
-        if report["exitstatus"] is None:
-            report["errors"].append("runner did not finish its session")
+            report.errors.append("unfinished tests: " + ", ".join(sorted(missing)))
+        if report.exitstatus is None:
+            report.errors.append("runner did not finish its session")
         return report
     except (OSError, ValueError, KeyError, TypeError) as err:
-        return dict(results=[], errors=[f"{path}: {err}"], exitstatus=1)
+        return ReportData(errors=[f"{path}: {err}"], exitstatus=1)
 
 
-def collect_tests(options: argparse.Namespace, collection_path: Path) -> tuple[int, dict[str, Any]]:
-    collection_path.unlink(missing_ok=True)
-    # Match short names locally; retain pytest IDs for invoking the runners.
-    command = [sys.executable, "-B", "-u", str(Path(__file__).resolve()), "--runner",
-               "--collect-only", "--report-json", str(collection_path),
-               *(["-v"] * options.verbose)]
-    result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-    status = result.returncode
-    if verbose() or status not in (0, pytest.ExitCode.NO_TESTS_COLLECTED):
-        print(result.stdout, end="")
-    if status not in (0, pytest.ExitCode.NO_TESTS_COLLECTED):
-        return status, {}
-    try:
-        collection = json.loads(collection_path.read_text())
-        collection["collected"] = [
-            test for test in collection["collected"]
-            if match_test_name(test["name"], options.test_pattern)
-        ]
-    except (OSError, ValueError, KeyError, TypeError) as err:
-        logging.error("Cannot read collected tests from %s: %s", collection_path, err)
-        return 1, {}
-    return 0, collection
+def collect_tests(options: argparse.Namespace) -> list[str]:
+    collected = []
+    load_case_modules()
+    for name in TESTS:
+        if match_test_name(name, options.test_pattern):
+            collected.append(name)
+            logging.info("%s", name)
+    return collected
 
 
 def run_tests_on_host(options: argparse.Namespace, shared_dir: Path,
-                      collected: list[dict[str, str]]) -> dict[str, Any]:
-    node_ids = [test["nodeid"] for test in collected]
+                      collected: list[str]) -> ReportData:
     report_path = shared_dir / "report-host.json"
-    runner_args = [*node_ids, "--wprof", str(options.wprof.resolve()), *(["-v"] * options.verbose),
+    runner_args = [*collected, "--wprof", str(options.wprof.resolve()), *(["-v"] * options.verbose),
                    "--report-json", str(report_path)]
     status = runner_main(runner_args)
     try:
-        report = json.loads(report_path.read_text())
-    except (OSError, ValueError) as err:
-        report = dict(collected=[], results=[], errors=[f"Cannot read runner report: {err}"],
-                      exitstatus=status if status != 0 else 1)
+        report = read_report(report_path)
+    except (OSError, ValueError, KeyError, TypeError) as err:
+        report = ReportData(errors=[f"Cannot read runner report: {err}"],
+                            exitstatus=status if status != 0 else 1)
     return report
 
 
@@ -537,9 +520,8 @@ def prepare_ssh_guest(shared_dir: Path, guest_command: list[str], ssh: int) -> l
 # File system mapping host -> guest:
 # - / -> /, read-only.
 # - /tmp/wprof-run -> /tmp/wprof-run: read/write:
-#   - vm-N.args: pytest arguments.
-#   - collection.json: all collected test names and pytest IDs.
-#   - report-vmN.json: per-VM results, with exact test IDs and outcomes.
+#   - vm-N.args: runner arguments.
+#   - report-vmN.json: per-VM results, with test names and outcomes.
 #   - report.json: combined results and infrastructure errors.
 #   - vm-N.log: VNG and guest console output.
 #   - vm-N-tests/some_test/capture-M/trace.json
@@ -547,12 +529,12 @@ def prepare_ssh_guest(shared_dir: Path, guest_command: list[str], ssh: int) -> l
 #   - vm-N-tests/some_test/capture-M/stderr.log
 # - _ -> /tmp, guest /tmp is private (to allow mmap'ing files within it).
 #
-# Test IDs go in an argument file (vm-N.args):
+# Test names go in an argument file (vm-N.args):
 #
 #   --report-json
 #   /tmp/wprof-run/report-vm0.json
-#   /work/wprof/test/cases/utrace.py::test_vfs_write_span
-#   /work/wprof/test/cases/utrace.py::test_vfs_write_retprobe
+#   utrace/test_vfs_write_span
+#   utrace/test_vfs_write_retprobe
 #
 # Example VM launch command:
 #
@@ -563,13 +545,12 @@ def prepare_ssh_guest(shared_dir: Path, guest_command: list[str], ssh: int) -> l
 #       --exec '/tmp/wprof-venv/bin/python -B -u \
 #       /work/wprof/test/selftests.py --runner @/tmp/wprof-run/vm-0.args'
 def run_tests_in_vm(options: argparse.Namespace, shared_dir: Path,
-                    collected: list[dict[str, str]]) -> dict[str, Any]:
-    node_ids = [test["nodeid"] for test in collected]
-    vm_count = min(options.vms, len(node_ids))
-    batches = [node_ids[i::vm_count] for i in range(vm_count)]
+                    collected: list[str]) -> ReportData:
+    vm_count = min(options.vms, len(collected))
+    batches = [collected[i::vm_count] for i in range(vm_count)]
     hugetlb = not options.no_hugetlb and hugetlb_available()
     logging.info("Running %d tests in %d VMs; artifacts: %s",
-                 len(node_ids), vm_count, shared_dir)
+                 len(collected), vm_count, shared_dir)
 
     async def run_vms() -> list[int]:
         with ExitStack() as cleanup:
@@ -585,14 +566,13 @@ def run_tests_in_vm(options: argparse.Namespace, shared_dir: Path,
                     runner_args = [
                         "--wprof", str(options.wprof.resolve()),
                         *(["-v"] * options.verbose),
-                        # Pytest clears its base directory. Keep each VM's directory separate
-                        # from the argument files, reports, and other VMs' artifacts.
+                        # Keep each VM's artifacts separate from the argument files and reports.
                         "--basetemp", str(shared_dir / f"vm-{vm_id}-tests"),
                         "--report-json", str(shared_dir / f"report-vm{vm_id}.json"),
                         *tests,
                     ]
                     args_file = shared_dir / f"vm-{vm_id}.args"
-                    # Pytest's @file syntax takes one argument per line, without shell quoting.
+                    # The runner's @file syntax takes one argument per line, without shell quoting.
                     args_file.write_text("\n".join(runner_args) + "\n")
                     guest_command = [
                         sys.executable, "-B", "-u",
@@ -614,27 +594,27 @@ def run_tests_in_vm(options: argparse.Namespace, shared_dir: Path,
 
     statuses = asyncio.run(run_vms())
 
-    results: list[dict[str, Any]] = []
+    results: list[TestResult] = []
     errors: list[str] = []
     for vm_id, (tests, status) in enumerate(zip(batches, statuses)):
         log_path = shared_dir / f"vm-{vm_id}.log"
         report_path = shared_dir / f"report-vm{vm_id}.json"
         if options.ssh and not report_path.exists():
             # An SSH session may end without running the tests.
-            report: dict[str, Any] = dict(results=[], errors=[], exitstatus=0)
+            report = ReportData(exitstatus=0)
         else:
             report = read_vm_report(report_path, tests)
         if hugetlb and status != 0:
             maybe_show_hugetlb_warning(log_path)
-        if (status != 0 or report["exitstatus"] != 0) and not report["errors"] and not any(
-            result["outcome"] == "failed" for result in report["results"]
+        if (status != 0 or report.exitstatus != 0) and not report.errors and not any(
+            result.outcome == "failed" for result in report.results
         ):
-            report["errors"].append(f"VM exited unsuccessfully; see {log_path}")
-        results.extend(report["results"])
-        errors.extend(f"VM {vm_id}: {error}" for error in report["errors"])
+            report.errors.append(f"VM exited unsuccessfully; see {log_path}")
+        results.extend(report.results)
+        errors.extend(f"VM {vm_id}: {error}" for error in report.errors)
     status = int(any(status != 0 for status in statuses) or bool(errors) or
-                 any(result["outcome"] == "failed" for result in results))
-    return dict(collected=collected, results=results, errors=errors, exitstatus=status)
+                 any(result.outcome == "failed" for result in results))
+    return ReportData(collected=collected, results=results, errors=errors, exitstatus=status)
 
 
 def launcher_main(args: list[str]) -> int:
@@ -672,34 +652,36 @@ def launcher_main(args: list[str]) -> int:
 
     shared_dir = Path(mkdtemp(prefix="wprof-selftests-", dir="/tmp")).resolve()
     destination = options.report_json.resolve() if options.report_json else shared_dir / "report.json"
-    status, collection = collect_tests(options, shared_dir / "collection.json")
-    if status != 0:
-        report = dict(collected=[],
-                      results=[],
-                      errors=[f"Test collection failed (exit status {status})"],
-                      exitstatus=status)
-    elif not collection["collected"]:
-        logging.error("No tests match %r", options.test_pattern)
-        report = dict(collected=[], results=[], errors=[], exitstatus=5)
-    elif options.no_vm:
-        report = run_tests_on_host(options, shared_dir, collection["collected"])
+    try:
+        collected = collect_tests(options)
+    except Exception:
+        logging.exception("Cannot collect tests")
+        report = ReportData(errors=["Test collection failed"], exitstatus=1)
     else:
-        report = run_tests_in_vm(options, shared_dir, collection["collected"])
+        if not collected:
+            logging.error("No tests match %r", options.test_pattern)
+            report = ReportData(exitstatus=5)
+        elif options.no_vm:
+            report = run_tests_on_host(options, shared_dir, collected)
+        else:
+            report = run_tests_in_vm(options, shared_dir, collected)
 
     destination.parent.mkdir(parents=True, exist_ok=True)
-    destination.write_text(json.dumps(report, indent=2) + "\n")
-    counts = {outcome: sum(r["complete"] and r["outcome"] == outcome for r in report["results"])
+    destination.write_text(json.dumps(asdict(report), indent=2) + "\n")
+    counts = {outcome: sum(r.complete and r.outcome == outcome for r in report.results)
               for outcome in ("passed", "failed", "skipped")}
     elapsed = time.monotonic() - start
     print(f"{counts['passed']} passed, {counts['failed']} failed, {counts['skipped']} skipped, "
-          f"{len(report['errors'])} infrastructure errors, elapsed time: {elapsed:.2f}s.")
+          f"{len(report.errors)} infrastructure errors, elapsed time: {elapsed:.2f}s.")
     print(f"Report: {destination}")
-    for error in report["errors"]:
+    for error in report.errors:
         logging.error("%s", error)
-    return int(report["exitstatus"])
+    return int(report.exitstatus)
 
 
 if __name__ == "__main__":
+    # Case modules must import the same registry/classes as this script.
+    sys.modules["selftests"] = sys.modules[__name__]
     try:
         args = sys.argv[1:]
         if args and args[0] == "--runner":

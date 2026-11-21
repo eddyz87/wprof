@@ -1,5 +1,6 @@
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from collections.abc import Iterator
+from functools import cache
 from multiprocessing.process import BaseProcess
 import os
 from pathlib import Path
@@ -8,9 +9,7 @@ import struct
 import subprocess
 import time
 
-import pytest
-
-from selftests import Artifacts, Sh, privileged
+from selftests import Artifacts, Sh, privileged, test
 
 
 NETLINK_SOCK_DIAG = 4
@@ -52,7 +51,7 @@ class SocketDiagTarget:
             time.sleep(0.01)
 
 
-@pytest.fixture(scope="session")
+@cache
 def inet_diag_modules():
     # Modules stay loaded for the session; the intended test environment is a disposable VM.
     for module in ("inet_diag", "tcp_diag"):
@@ -68,8 +67,9 @@ def inet_diag_modules():
     assert {"vmlinux", "[inet_diag]"} <= owners, "test requires sk_diag_fill in both vmlinux and inet_diag"
 
 
-@pytest.fixture
-def established_tcp_diag(inet_diag_modules) -> Iterator[SocketDiagTarget]:
+@contextmanager
+def established_tcp_diag() -> Iterator[SocketDiagTarget]:
+    inet_diag_modules()
     with ExitStack() as sockets:
         listener = sockets.enter_context(socket.socket(socket.AF_INET, socket.SOCK_STREAM))
         listener.bind(("127.0.0.1", 0))
@@ -91,7 +91,7 @@ def established_tcp_diag(inet_diag_modules) -> Iterator[SocketDiagTarget]:
         yield target
 
 
-@pytest.fixture
+@contextmanager
 def netlink_diag() -> Iterator[SocketDiagTarget]:
     with ExitStack() as sockets:
         target = sockets.enter_context(socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, 2))  # NETLINK_USERSOCK
@@ -105,14 +105,16 @@ def netlink_diag() -> Iterator[SocketDiagTarget]:
         yield query
 
 
-@pytest.fixture(scope="session")
-def udp_diag_modules(inet_diag_modules) -> None:
+@cache
+def udp_diag_modules() -> None:
+    inet_diag_modules()
     if not Path("/sys/module/udp_diag").exists():
         subprocess.run(privileged(["modprobe", "udp_diag"]), check=True, timeout=10)
 
 
-@pytest.fixture
-def udp_diag(udp_diag_modules) -> Iterator[SocketDiagTarget]:
+@contextmanager
+def udp_diag() -> Iterator[SocketDiagTarget]:
+    udp_diag_modules()
     with ExitStack() as sockets:
         target = sockets.enter_context(socket.socket(socket.AF_INET, socket.SOCK_DGRAM))
         target.bind(("127.0.0.1", 0))
@@ -125,7 +127,6 @@ def udp_diag(udp_diag_modules) -> Iterator[SocketDiagTarget]:
         yield query
 
 
-@pytest.fixture
 def write_workers(sh: Sh) -> tuple[BaseProcess, BaseProcess]:
     def write_workload():
         fd = os.memfd_create("vfs-write-test")
@@ -157,10 +158,12 @@ def skipped_inline_warnings(artifacts: Artifacts) -> list[str]:
 # Exercise module filtering when kallsyms contains the same function name in
 # vmlinux and inet_diag. TCP diagnostics call the module's sk_diag_fill;
 # netlink diagnostics call the kernel's. An unqualified probe must cover both.
-@pytest.mark.utrace
-def test_inet_diag_selector(sh: Sh, established_tcp_diag: SocketDiagTarget, netlink_diag: SocketDiagTarget) -> None:
-    tcp_worker = sh.fork(established_tcp_diag.run)
-    netlink_worker = sh.fork(netlink_diag.run)
+@test
+def test_inet_diag_selector(sh: Sh) -> None:
+    tcp_diag = sh.enter_context(established_tcp_diag())
+    netlink_target = sh.enter_context(netlink_diag())
+    tcp_worker = sh.fork(tcp_diag.run)
+    netlink_worker = sh.fork(netlink_target.run)
     process, artifacts = sh.wprof(
         """
             -d 1s --no-stacks -p $tcp_pid -p $netlink_pid
@@ -184,12 +187,12 @@ def test_inet_diag_selector(sh: Sh, established_tcp_diag: SocketDiagTarget, netl
     netlink_bare_count = len(events[netlink_worker.pid, "bare"])
 
     # Both workloads must reach their respective sk_diag_fill implementations.
-    assert module_count >= 20
-    assert kernel_count >= 20
+    assert module_count >= 20, f"{module_count=}"
+    assert kernel_count >= 20, f"{kernel_count=}"
     # Omitting the module covers both owners, without duplicate attachments.
     # Separate probes can start or stop on opposite sides of one invocation.
-    assert abs(tcp_bare_count - module_count) <= 1
-    assert abs(netlink_bare_count - kernel_count) <= 1
+    assert abs(tcp_bare_count - module_count) <= 1, f"{tcp_bare_count=}, {module_count=}"
+    assert abs(netlink_bare_count - kernel_count) <= 1, f"{netlink_bare_count=}, {kernel_count=}"
     # Explicit selectors must not leak into the other owner's implementation.
     assert (tcp_worker.pid, "kernel") not in events
     assert (netlink_worker.pid, "module") not in events
@@ -199,9 +202,9 @@ def test_inet_diag_selector(sh: Sh, established_tcp_diag: SocketDiagTarget, netl
 # In this kernel, write() reaches an inline vfs_write expansion and pwrite()
 # calls its standalone body. Syscall exit events provide independent counts;
 # return probes can cover only the standalone body.
-@pytest.mark.utrace
-def test_vfs_write_inline_and_outline(sh: Sh, write_workers: tuple[BaseProcess, BaseProcess]) -> None:
-    writer, pwriter = write_workers
+@test
+def test_vfs_write_inline_and_outline(sh: Sh) -> None:
+    writer, pwriter = write_workers(sh)
     process, artifacts = sh.wprof(
         """
             -d 1s --no-stacks -p $write_pid -p $pwrite_pid
@@ -230,18 +233,18 @@ def test_vfs_write_inline_and_outline(sh: Sh, write_workers: tuple[BaseProcess, 
     return_count       = len(events[pwriter.pid, "return_control"])
 
     # Both workloads must have run during capture.
-    assert write_count >= 20
-    assert pwrite_count >= 20
+    assert write_count >= 20, f"{write_count=}"
+    assert pwrite_count >= 20, f"{pwrite_count=}"
     # Entry probes cover inline write() and standalone pwrite() calls.
     # A syscall may straddle a capture boundary, so counts may differ by one.
-    assert abs(write_entry_count - write_count) <= 1
-    assert abs(pwrite_entry_count - pwrite_count) <= 1
+    assert abs(write_entry_count - write_count) <= 1, f"{write_entry_count=}, {write_count=}"
+    assert abs(pwrite_entry_count - pwrite_count) <= 1, f"{pwrite_entry_count=}, {pwrite_count=}"
     # Explicit +0 preserves both attachments.
-    assert abs(write_zero_count - write_count) <= 1
-    assert abs(pwrite_zero_count - pwrite_count) <= 1
+    assert abs(write_zero_count - write_count) <= 1, f"{write_zero_count=}, {write_count=}"
+    assert abs(pwrite_zero_count - pwrite_count) <= 1, f"{pwrite_zero_count=}, {pwrite_count=}"
     # Return probes cover only standalone calls.
     # Inline expansions have no standalone return site to probe.
-    assert abs(return_count - pwrite_count) <= 1
+    assert abs(return_count - pwrite_count) <= 1, f"{return_count=}, {pwrite_count=}"
     assert (writer.pid, "return_control") not in events
 
     warnings = skipped_inline_warnings(artifacts)
@@ -252,9 +255,9 @@ def test_vfs_write_inline_and_outline(sh: Sh, write_workers: tuple[BaseProcess, 
 # Preserve native span behavior without an entry probe requesting DWARF indexing.
 # pwrite() calls the standalone vfs_write, producing paired entry/exit events
 # with a byte count and result. The inline write() path has no span to attach to.
-@pytest.mark.utrace
-def test_vfs_write_span(sh: Sh, write_workers: tuple[BaseProcess, BaseProcess]) -> None:
-    writer, pwriter = write_workers
+@test
+def test_vfs_write_span(sh: Sh) -> None:
+    writer, pwriter = write_workers(sh)
     process, artifacts = sh.wprof(
         """
             -d 1s --no-stacks -p $write_pid -p $pwrite_pid
@@ -281,11 +284,11 @@ def test_vfs_write_span(sh: Sh, write_workers: tuple[BaseProcess, BaseProcess]) 
     exit_count   = len(exits)
 
     # Both workloads must have run during capture.
-    assert write_count >= 20
-    assert pwrite_count >= 20
+    assert write_count >= 20, f"{write_count=}"
+    assert pwrite_count >= 20, f"{pwrite_count=}"
     # Each standalone call produces two span phases; allow one boundary event.
-    assert abs(entry_count - pwrite_count) <= 1
-    assert abs(exit_count - pwrite_count) <= 1
+    assert abs(entry_count - pwrite_count) <= 1, f"{entry_count=}, {pwrite_count=}"
+    assert abs(exit_count - pwrite_count) <= 1, f"{exit_count=}, {pwrite_count=}"
     # Entry arguments and return values must survive span capture.
     assert all(e.args.count == 1 for e in entries)
     assert all(e.args.result == 1 for e in exits)
@@ -301,9 +304,9 @@ def test_vfs_write_span(sh: Sh, write_workers: tuple[BaseProcess, BaseProcess]) 
 # Exercise span filtering after another spec populates the DWARF function index.
 # The entry probe finds inline and standalone vfs_write bodies; both span legs
 # must exclude inline bodies while retaining argument capture for pwrite().
-@pytest.mark.utrace
-def test_vfs_write_span_with_entry_probe(sh: Sh, write_workers: tuple[BaseProcess, BaseProcess]) -> None:
-    writer, pwriter = write_workers
+@test
+def test_vfs_write_span_with_entry_probe(sh: Sh) -> None:
+    writer, pwriter = write_workers(sh)
     process, artifacts = sh.wprof(
         """
             -d 1s --no-stacks -p $write_pid -p $pwrite_pid
@@ -333,14 +336,14 @@ def test_vfs_write_span_with_entry_probe(sh: Sh, write_workers: tuple[BaseProces
     exit_count        = len(exits)
 
     # Both workloads must have run during capture.
-    assert write_count >= 20
-    assert pwrite_count >= 20
+    assert write_count >= 20, f"{write_count=}"
+    assert pwrite_count >= 20, f"{pwrite_count=}"
     # The seed probe proves that both inline and standalone addresses were found.
-    assert abs(write_seed_count - write_count) <= 1
-    assert abs(pwrite_seed_count - pwrite_count) <= 1
+    assert abs(write_seed_count - write_count) <= 1, f"{write_seed_count=}, {write_count=}"
+    assert abs(pwrite_seed_count - pwrite_count) <= 1, f"{pwrite_seed_count=}, {pwrite_count=}"
     # Only standalone calls produce spans; allow one event at capture boundaries.
-    assert abs(entry_count - pwrite_count) <= 1
-    assert abs(exit_count - pwrite_count) <= 1
+    assert abs(entry_count - pwrite_count) <= 1, f"{entry_count=}, {pwrite_count=}"
+    assert abs(exit_count - pwrite_count) <= 1, f"{exit_count=}, {pwrite_count=}"
     assert (writer.pid, "utrace_entry", "subject") not in events
     assert (writer.pid, "utrace_exit", "subject") not in events
     # Resolving through DWARF must preserve the captured arguments and phase order.
@@ -356,9 +359,9 @@ def test_vfs_write_span_with_entry_probe(sh: Sh, write_workers: tuple[BaseProces
 # Preserve return-probe behavior when no entry probe requests DWARF indexing.
 # Only the standalone vfs_write called by pwrite() has a return site; its return
 # value must still be captured after switching from name to address attachment.
-@pytest.mark.utrace
-def test_vfs_write_retprobe(sh: Sh, write_workers: tuple[BaseProcess, BaseProcess]) -> None:
-    writer, pwriter = write_workers
+@test
+def test_vfs_write_retprobe(sh: Sh) -> None:
+    writer, pwriter = write_workers(sh)
     process, artifacts = sh.wprof(
         """
             -d 1s --no-stacks -p $write_pid -p $pwrite_pid
@@ -379,10 +382,10 @@ def test_vfs_write_retprobe(sh: Sh, write_workers: tuple[BaseProcess, BaseProces
     return_count = len(returns)
 
     # Both workloads must have run during capture.
-    assert write_count >= 20
-    assert pwrite_count >= 20
+    assert write_count >= 20, f"{write_count=}"
+    assert pwrite_count >= 20, f"{pwrite_count=}"
     # Each standalone call returns one byte; allow one event at capture boundaries.
-    assert abs(return_count - pwrite_count) <= 1
+    assert abs(return_count - pwrite_count) <= 1, f"{return_count=}, {pwrite_count=}"
     assert all(e.args.result == 1 for e in returns)
     # An inline expansion has no standalone return site.
     assert (writer.pid, "subject") not in events
@@ -393,9 +396,9 @@ def test_vfs_write_retprobe(sh: Sh, write_workers: tuple[BaseProcess, BaseProces
 # Exercise return-probe filtering with inline records present in the DWARF index.
 # The entry probe indexes both forms of vfs_write; the return probe must exclude
 # inline sites and report the omission once, while pwrite() still yields results.
-@pytest.mark.utrace
-def test_vfs_write_retprobe_with_entry_probe(sh: Sh, write_workers: tuple[BaseProcess, BaseProcess]) -> None:
-    writer, pwriter = write_workers
+@test
+def test_vfs_write_retprobe_with_entry_probe(sh: Sh) -> None:
+    writer, pwriter = write_workers(sh)
     process, artifacts = sh.wprof(
         """
             -d 1s --no-stacks -p $write_pid -p $pwrite_pid
@@ -419,13 +422,13 @@ def test_vfs_write_retprobe_with_entry_probe(sh: Sh, write_workers: tuple[BasePr
     return_count      = len(returns)
 
     # Both workloads must have run during capture.
-    assert write_count >= 20
-    assert pwrite_count >= 20
+    assert write_count >= 20, f"{write_count=}"
+    assert pwrite_count >= 20, f"{pwrite_count=}"
     # The seed probe verifies that both forms are present in the indexed targets.
-    assert abs(write_seed_count - write_count) <= 1
-    assert abs(pwrite_seed_count - pwrite_count) <= 1
+    assert abs(write_seed_count - write_count) <= 1, f"{write_seed_count=}, {write_count=}"
+    assert abs(pwrite_seed_count - pwrite_count) <= 1, f"{pwrite_seed_count=}, {pwrite_count=}"
     # Return filtering must retain standalone calls and their results, with boundary tolerance.
-    assert abs(return_count - pwrite_count) <= 1
+    assert abs(return_count - pwrite_count) <= 1, f"{return_count=}, {pwrite_count=}"
     assert all(e.args.result == 1 for e in returns)
     assert (writer.pid, "subject") not in events
     # Report one summary for the two inline sites excluded from return attachment.
@@ -437,9 +440,9 @@ def test_vfs_write_retprobe_with_entry_probe(sh: Sh, write_workers: tuple[BasePr
 # Exercise declaration-file filtering before attachment. A full relative path
 # and a basename must select the same DWARF records as the unfiltered name:
 # inline vfs_write for write(), and its standalone body for pwrite().
-@pytest.mark.utrace
-def test_vfs_write_file_selectors(sh: Sh, write_workers: tuple[BaseProcess, BaseProcess]) -> None:
-    writer, pwriter = write_workers
+@test
+def test_vfs_write_file_selectors(sh: Sh) -> None:
+    writer, pwriter = write_workers(sh)
     process, artifacts = sh.wprof(
         """
             -d 1s --no-stacks -p $write_pid -p $pwrite_pid
@@ -466,17 +469,17 @@ def test_vfs_write_file_selectors(sh: Sh, write_workers: tuple[BaseProcess, Base
     pwrite_basename       = len(events[pwriter.pid, "basename"])
 
     # Both workloads must have run during capture.
-    assert write_count >= 20
-    assert pwrite_count >= 20
+    assert write_count >= 20, f"{write_count=}"
+    assert pwrite_count >= 20, f"{pwrite_count=}"
     # Unfiltered probes cover both forms; allow one event at capture boundaries.
-    assert abs(write_unfiltered - write_count) <= 1
-    assert abs(pwrite_unfiltered - pwrite_count) <= 1
+    assert abs(write_unfiltered - write_count) <= 1, f"{write_unfiltered=}, {write_count=}"
+    assert abs(pwrite_unfiltered - pwrite_count) <= 1, f"{pwrite_unfiltered=}, {pwrite_count=}"
     # The complete declaration path must retain both inline and standalone bodies.
-    assert abs(write_full_path - write_count) <= 1
-    assert abs(pwrite_full_path - pwrite_count) <= 1
+    assert abs(write_full_path - write_count) <= 1, f"{write_full_path=}, {write_count=}"
+    assert abs(pwrite_full_path - pwrite_count) <= 1, f"{pwrite_full_path=}, {pwrite_count=}"
     # Matching only the final path component must retain those same bodies.
-    assert abs(write_basename - write_count) <= 1
-    assert abs(pwrite_basename - pwrite_count) <= 1
+    assert abs(write_basename - write_count) <= 1, f"{write_basename=}, {write_count=}"
+    assert abs(pwrite_basename - pwrite_count) <= 1, f"{pwrite_basename=}, {pwrite_count=}"
     # Entry probes do not exclude inline sites, so no skip summary is expected.
     assert skipped_inline_warnings(artifacts) == []
 
@@ -484,7 +487,7 @@ def test_vfs_write_file_selectors(sh: Sh, write_workers: tuple[BaseProcess, Base
 # A correct basename under the wrong directory must not match fs/read_write.c.
 # Resolution happens before capture; a file selector must also prevent kallsyms
 # fallback from silently attaching to the otherwise valid vfs_write symbol.
-@pytest.mark.utrace
+@test
 def test_vfs_write_wrong_directory(sh: Sh) -> None:
     process, artifacts = sh.wprof("""
         -d 1s --no-stacks -U 'k:vfs_write@net/read_write.c' -D "$data" -J "$json"
@@ -497,7 +500,7 @@ def test_vfs_write_wrong_directory(sh: Sh) -> None:
 
 # A suffix must start at a path-component boundary. ead_write.c is a string
 # suffix of read_write.c, but not a declaration-file selector for that file.
-@pytest.mark.utrace
+@test
 def test_vfs_write_partial_basename(sh: Sh) -> None:
     process, artifacts = sh.wprof("""
         -d 1s --no-stacks -U 'k:vfs_write@ead_write.c' -D "$data" -J "$json"
@@ -510,7 +513,7 @@ def test_vfs_write_partial_basename(sh: Sh) -> None:
 
 # Check the same component-boundary rule for a suffix containing a slash:
 # s/read_write.c must not match fs/read_write.c just because it ends the path.
-@pytest.mark.utrace
+@test
 def test_vfs_write_partial_directory(sh: Sh) -> None:
     process, artifacts = sh.wprof("""
         -d 1s --no-stacks -U 'k:vfs_write@s/read_write.c' -D "$data" -J "$json"
@@ -524,9 +527,10 @@ def test_vfs_write_partial_directory(sh: Sh) -> None:
 # Exercise named-module and any-module lookup for a module-only function.
 # Repeated UDP socket diagnostic dumps call udp_diag_dump in udp_diag; the
 # bare and qualified probes must observe the same invocations.
-@pytest.mark.utrace
-def test_udp_diag_module_selector(sh: Sh, udp_diag: SocketDiagTarget) -> None:
-    worker = sh.fork(udp_diag.run)
+@test
+def test_udp_diag_module_selector(sh: Sh) -> None:
+    diag = sh.enter_context(udp_diag())
+    worker = sh.fork(diag.run)
     process, artifacts = sh.wprof(
         """
             -d 1s --no-stacks -p $pid
@@ -545,16 +549,17 @@ def test_udp_diag_module_selector(sh: Sh, udp_diag: SocketDiagTarget) -> None:
     bare_count      = len(events["bare"])
 
     # The workload must reach the module's diagnostic dump handler.
-    assert qualified_count >= 20
+    assert qualified_count >= 20, f"{qualified_count=}"
     # Any-module lookup must cover the same handler, with one boundary event allowed.
-    assert abs(bare_count - qualified_count) <= 1
+    assert abs(bare_count - qualified_count) <= 1, f"{bare_count=}, {qualified_count=}"
 
 
 # Explicit module selection must restrict lookup even when another loaded
 # module owns a symbol with the requested name. tcp_diag exists, but the
 # udp_diag_dump symbol belongs to udp_diag, so resolution must fail.
-@pytest.mark.utrace
-def test_udp_diag_wrong_module(sh: Sh, udp_diag_modules) -> None:
+@test
+def test_udp_diag_wrong_module(sh: Sh) -> None:
+    udp_diag_modules()
     process, artifacts = sh.wprof("""
         -d 1s --no-stacks -U 'k:tcp_diag:udp_diag_dump' -D "$data" -J "$json"
     """)
@@ -567,7 +572,7 @@ def test_udp_diag_wrong_module(sh: Sh, udp_diag_modules) -> None:
 # Exercise nonzero-offset filtering and the legacy address-attachment failure
 # path. On this x86-64 kernel the large offset is outside kernel text. Inline
 # sites must be excluded before the remaining standalone target fails to attach.
-@pytest.mark.utrace
+@test
 def test_vfs_write_invalid_offset(sh: Sh) -> None:
     process, artifacts = sh.wprof("""
         -d 1s --no-stacks -U 'k:vfs_write+0x7fffffff' -D "$data" -J "$json"
