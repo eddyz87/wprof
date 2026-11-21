@@ -452,7 +452,7 @@ def collect_tests(options: argparse.Namespace, collection_path: Path) -> tuple[i
     collection_path.unlink(missing_ok=True)
     # Apply selectors during collection only. Each guest receives its assigned
     # node IDs as positional arguments, without the original paths or filters.
-    command = [sys.executable, "-B", "-u", str(Path(__file__).resolve()), "runner",
+    command = [sys.executable, "-B", "-u", str(Path(__file__).resolve()), "--runner",
                *options.tests, "--collect-only", "--report-json", str(collection_path),
                *(["-v"] * options.verbose)]
     if options.keyword:
@@ -542,7 +542,8 @@ def prepare_ssh_guest(shared_dir: Path, guest_command: list[str], ssh: int) -> l
 #       --cpus 2 --memory 4G --rwdir /tmp/wprof-run \
 #       --disable-microvm --qemu-opts='-machine q35' \
 #       --rodir /tmp/wprof-venv=/tmp/wprof-venv \
-#       --exec '/tmp/wprof-venv/bin/python -B -u /work/wprof/test/selftests.py runner @/tmp/wprof-run/vm-0.args'
+#       --exec '/tmp/wprof-venv/bin/python -B -u \
+#       /work/wprof/test/selftests.py --runner @/tmp/wprof-run/vm-0.args'
 def run_tests_in_vm(options: argparse.Namespace, shared_dir: Path) -> dict[str, Any]:
     status, collection = collect_tests(options, shared_dir / "collection.json")
     if status != 0:
@@ -586,7 +587,7 @@ def run_tests_in_vm(options: argparse.Namespace, shared_dir: Path) -> dict[str, 
                     args_file.write_text("\n".join(runner_args) + "\n")
                     guest_command = [
                         sys.executable, "-B", "-u",
-                        str(Path(__file__).resolve()), "runner", f"@{args_file}",
+                        str(Path(__file__).resolve()), "--runner", f"@{args_file}",
                     ]
                     if options.ssh:
                         guest_command = prepare_ssh_guest(shared_dir, guest_command, options.ssh)
@@ -630,7 +631,7 @@ def run_tests_in_vm(options: argparse.Namespace, shared_dir: Path) -> dict[str, 
 def launcher_main(args: list[str]) -> int:
     start = time.monotonic()
     parser = argparse.ArgumentParser(
-        prog="selftests.py launcher", allow_abbrev=False,
+        prog="selftests.py", allow_abbrev=False,
         description="Run selected tests in virtme-ng guests or on the host.",
     )
     parser.add_argument("tests", nargs="*", help="test paths or node IDs (default: test/cases)")
@@ -682,13 +683,12 @@ def launcher_main(args: list[str]) -> int:
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="wprof test runner and VM launcher")
-    parser.add_argument("command", choices=("runner", "launcher"))
-    parser.add_argument("args", nargs=argparse.REMAINDER)
-    arguments = parser.parse_args()
-    entry = runner_main if arguments.command == "runner" else launcher_main
     try:
-        status = entry(arguments.args)
+        args = sys.argv[1:]
+        if args and args[0] == "--runner":
+            status = runner_main(args[1:])
+        else:
+            status = launcher_main(args)
     except KeyboardInterrupt:
         # Cleanup has unwound; suppress the traceback and use the conventional Ctrl-C status.
         status = 130
