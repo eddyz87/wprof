@@ -5,6 +5,7 @@ from collections.abc import Callable, Hashable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 from dataclasses import dataclass
+from fnmatch import fnmatchcase
 from functools import cached_property
 from multiprocessing.process import BaseProcess
 from pathlib import Path
@@ -118,6 +119,22 @@ class Sh:
     wprof: Callable[..., tuple[subprocess.Popen[bytes], Artifacts]]
 
 
+# Translate from pytest NodeID to <basename>/<function> naming format.
+# E.g. test/cases/utrace.py::test_vfs_write_wrong_directory ->
+#      utrace/test_vfs_write_wrong_directory
+def short_test_name(nodeid: str) -> str:
+    path, _, selector = nodeid.partition("::")
+    return f"{Path(path).stem}/{selector}"
+
+
+def match_test_name(name: str, pattern: str) -> bool:
+    stem, _, function = name.partition("/")
+    stem_pattern, separator, function_pattern = pattern.partition("/")
+    return fnmatchcase(stem, stem_pattern) and (
+        not separator or fnmatchcase(function, function_pattern)
+    )
+
+
 def absolute_nodeid(item: pytest.Item) -> str:
     # Make the file path absolute while preserving the selector,
     # including any parametrized test ID.
@@ -130,7 +147,7 @@ class JsonReport:
     def __init__(self, path: Path) -> None:
         self.path = path
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.collected: list[str] = []
+        self.collected: list[dict[str, str]] = []
         self.results: dict[str, dict[str, Any]] = {}
         self.errors: list[str] = []
         self.exitstatus: int | None = None
@@ -141,7 +158,11 @@ class JsonReport:
         self.path.write_text(json.dumps(report, indent=2) + "\n")
 
     def pytest_collection_finish(self, session: pytest.Session) -> None:
-        self.collected = list(dict.fromkeys(absolute_nodeid(item) for item in session.items))
+        node_ids = dict.fromkeys(absolute_nodeid(item) for item in session.items)
+        self.collected = [
+            dict(nodeid=nodeid, name=short_test_name(nodeid))
+            for nodeid in node_ids
+        ]
         self.write()
 
     def pytest_collectreport(self, report: pytest.CollectReport) -> None:
@@ -153,7 +174,8 @@ class JsonReport:
         report = yield
         nodeid = absolute_nodeid(item)
         result = self.results.setdefault(nodeid, dict(
-            test=nodeid, outcome="passed", duration=0.0, complete=False, details=[],
+            nodeid=nodeid, name=short_test_name(nodeid),
+            outcome="passed", duration=0.0, complete=False, details=[],
         ))
         # Keep pytest's durations and combine setup, call, and teardown into
         # one result. A passing teardown must not hide an earlier failure.
@@ -212,7 +234,7 @@ class ProgressReport:
             self.outcomes.setdefault(report.nodeid, "skipped")
 
         if report.when == "teardown":
-            label = f"{report.nodeid}:"
+            label = f"{short_test_name(report.nodeid)}:"
             outcome = self.outcomes.pop(report.nodeid, "passed")
             duration = self.durations.pop(report.nodeid)
             timing = f" {duration:7.2f}s" if self.show_timings else ""
@@ -430,8 +452,8 @@ def read_vm_report(path: Path, expected: list[str]) -> dict[str, Any]:
     try:
         report = json.loads(path.read_text())
         results = report["results"]
-        ids = [result["test"] for result in results]
-        completed = {result["test"] for result in results if result["complete"] is True}
+        ids = [result["nodeid"] for result in results]
+        completed = {result["nodeid"] for result in results if result["complete"] is True}
         if not isinstance(report["errors"], list) or any(not isinstance(e, str) for e in report["errors"]):
             raise ValueError("invalid errors list")
         if any(result["outcome"] not in ("passed", "failed", "skipped") for result in results):
@@ -440,7 +462,7 @@ def read_vm_report(path: Path, expected: list[str]) -> dict[str, Any]:
             raise ValueError("duplicate or unexpected test IDs")
         missing = set(expected) - completed
         if missing:
-            report["errors"].append("unfinished tests: " + ", ".join(sorted(missing)))
+            report["errors"].append("unfinished tests: " + ", ".join(sorted(map(short_test_name, missing))))
         if report["exitstatus"] is None:
             report["errors"].append("runner did not finish its session")
         return report
@@ -450,15 +472,10 @@ def read_vm_report(path: Path, expected: list[str]) -> dict[str, Any]:
 
 def collect_tests(options: argparse.Namespace, collection_path: Path) -> tuple[int, dict[str, Any]]:
     collection_path.unlink(missing_ok=True)
-    # Apply selectors during collection only. Each guest receives its assigned
-    # node IDs as positional arguments, without the original paths or filters.
+    # Match short names locally; retain pytest IDs for invoking the runners.
     command = [sys.executable, "-B", "-u", str(Path(__file__).resolve()), "--runner",
-               *options.tests, "--collect-only", "--report-json", str(collection_path),
+               "--collect-only", "--report-json", str(collection_path),
                *(["-v"] * options.verbose)]
-    if options.keyword:
-        command.extend(["-k", options.keyword])
-    if options.markexpr:
-        command.extend(["-m", options.markexpr])
     result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     status = result.returncode
     if verbose() or status not in (0, pytest.ExitCode.NO_TESTS_COLLECTED):
@@ -467,21 +484,22 @@ def collect_tests(options: argparse.Namespace, collection_path: Path) -> tuple[i
         return status, {}
     try:
         collection = json.loads(collection_path.read_text())
-        collection["collected"] = list(dict.fromkeys(collection["collected"]))
+        collection["collected"] = [
+            test for test in collection["collected"]
+            if match_test_name(test["name"], options.test_pattern)
+        ]
     except (OSError, ValueError, KeyError, TypeError) as err:
         logging.error("Cannot read collected tests from %s: %s", collection_path, err)
         return 1, {}
     return 0, collection
 
 
-def run_tests_on_host(options: argparse.Namespace, shared_dir: Path) -> dict[str, Any]:
+def run_tests_on_host(options: argparse.Namespace, shared_dir: Path,
+                      collected: list[dict[str, str]]) -> dict[str, Any]:
+    node_ids = [test["nodeid"] for test in collected]
     report_path = shared_dir / "report-host.json"
-    runner_args = [*options.tests, "--wprof", str(options.wprof.resolve()), *(["-v"] * options.verbose),
+    runner_args = [*node_ids, "--wprof", str(options.wprof.resolve()), *(["-v"] * options.verbose),
                    "--report-json", str(report_path)]
-    if options.keyword:
-        runner_args.extend(["-k", options.keyword])
-    if options.markexpr:
-        runner_args.extend(["-m", options.markexpr])
     status = runner_main(runner_args)
     try:
         report = json.loads(report_path.read_text())
@@ -520,7 +538,7 @@ def prepare_ssh_guest(shared_dir: Path, guest_command: list[str], ssh: int) -> l
 # - / -> /, read-only.
 # - /tmp/wprof-run -> /tmp/wprof-run: read/write:
 #   - vm-N.args: pytest arguments.
-#   - collection.json: selected test IDs from the runner.
+#   - collection.json: all collected test names and pytest IDs.
 #   - report-vmN.json: per-VM results, with exact test IDs and outcomes.
 #   - report.json: combined results and infrastructure errors.
 #   - vm-N.log: VNG and guest console output.
@@ -544,19 +562,10 @@ def prepare_ssh_guest(shared_dir: Path, guest_command: list[str], ssh: int) -> l
 #       --rodir /tmp/wprof-venv=/tmp/wprof-venv \
 #       --exec '/tmp/wprof-venv/bin/python -B -u \
 #       /work/wprof/test/selftests.py --runner @/tmp/wprof-run/vm-0.args'
-def run_tests_in_vm(options: argparse.Namespace, shared_dir: Path) -> dict[str, Any]:
-    status, collection = collect_tests(options, shared_dir / "collection.json")
-    if status != 0:
-        return dict(collected=[],
-                    results=[],
-                    errors=[f"Test collection failed (exit status {status})"],
-                    exitstatus=status)
-
-    node_ids = collection["collected"]
+def run_tests_in_vm(options: argparse.Namespace, shared_dir: Path,
+                    collected: list[dict[str, str]]) -> dict[str, Any]:
+    node_ids = [test["nodeid"] for test in collected]
     vm_count = min(options.vms, len(node_ids))
-    if vm_count == 0:
-        logging.error("No tests matched the selection")
-        return dict(collected=[], results=[], errors=[], exitstatus=5)
     batches = [node_ids[i::vm_count] for i in range(vm_count)]
     hugetlb = not options.no_hugetlb and hugetlb_available()
     logging.info("Running %d tests in %d VMs; artifacts: %s",
@@ -625,7 +634,7 @@ def run_tests_in_vm(options: argparse.Namespace, shared_dir: Path) -> dict[str, 
         errors.extend(f"VM {vm_id}: {error}" for error in report["errors"])
     status = int(any(status != 0 for status in statuses) or bool(errors) or
                  any(result["outcome"] == "failed" for result in results))
-    return dict(collected=node_ids, results=results, errors=errors, exitstatus=status)
+    return dict(collected=collected, results=results, errors=errors, exitstatus=status)
 
 
 def launcher_main(args: list[str]) -> int:
@@ -634,9 +643,8 @@ def launcher_main(args: list[str]) -> int:
         prog="selftests.py", allow_abbrev=False,
         description="Run selected tests in virtme-ng guests or on the host.",
     )
-    parser.add_argument("tests", nargs="*", help="test paths or node IDs (default: test/cases)")
-    parser.add_argument("-k", dest="keyword", metavar="EXPR", help="pytest test-name selection expression")
-    parser.add_argument("-m", dest="markexpr", metavar="EXPR", help="pytest marker selection expression")
+    parser.add_argument("-t", dest="test_pattern", default="*", metavar="GLOB",
+                        help="match FILE or FILE/FUNCTION globs, without the file extension (default: all)")
     parser.add_argument("--wprof", type=Path, default=Path(__file__).resolve().parent.parent / "src/wprof",
                         help="wprof binary to test (default: src/wprof)")
     parser.add_argument("--no-vm", action="store_true", help="run tests on the host instead of starting VMs")
@@ -650,7 +658,7 @@ def launcher_main(args: list[str]) -> int:
     parser.add_argument("--vm-timeout", type=float, default=300, help="seconds per VM, including boot (default: 300)")
     parser.add_argument("--report-json", type=Path, help="write results as JSON (default: <output directory>/report.json)")
     parser.add_argument("-v", "--verbose", action="count", default=0, help="show commands and verbose test output")
-    options = parser.parse_intermixed_args(args)
+    options = parser.parse_args(args)
     if options.ssh is not None:
         if not 1 <= options.ssh <= 65535:
             parser.error("--ssh must be a TCP port between 1 and 65535")
@@ -664,10 +672,19 @@ def launcher_main(args: list[str]) -> int:
 
     shared_dir = Path(mkdtemp(prefix="wprof-selftests-", dir="/tmp")).resolve()
     destination = options.report_json.resolve() if options.report_json else shared_dir / "report.json"
-    if options.no_vm:
-        report = run_tests_on_host(options, shared_dir)
+    status, collection = collect_tests(options, shared_dir / "collection.json")
+    if status != 0:
+        report = dict(collected=[],
+                      results=[],
+                      errors=[f"Test collection failed (exit status {status})"],
+                      exitstatus=status)
+    elif not collection["collected"]:
+        logging.error("No tests match %r", options.test_pattern)
+        report = dict(collected=[], results=[], errors=[], exitstatus=5)
+    elif options.no_vm:
+        report = run_tests_on_host(options, shared_dir, collection["collected"])
     else:
-        report = run_tests_in_vm(options, shared_dir)
+        report = run_tests_in_vm(options, shared_dir, collection["collected"])
 
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_text(json.dumps(report, indent=2) + "\n")
