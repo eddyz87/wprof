@@ -12,9 +12,12 @@ Test harness consists of the following components:
   bundles compilation.
 
 The test harness runs selftests directly on the host or in a VM.
+A VM can boot the host's kernel, a custom-built kernel, or one of the
+predefined kernels used in CI.
 
 Test harness allows to:
 - Run the tests in parallel across multiple VMs.
+- Run the suite locally in the same environment used by CI.
 - Connect to a VM over SSH and run individual tests manually to
   investigate failures.
 
@@ -27,6 +30,20 @@ These functions are supposed to:
   test expectations.
 
 ## Quick start
+
+### Run the CI suite locally
+
+On an x86-64 Linux host with rootless Podman and access to `/dev/kvm`,
+build the CI environment image, compile wprof and the kernel bundles,
+then run the eligible tests in two VMs per kernel.
+
+```sh
+./test/ci/build-container.sh
+./test/ci/with-ci-env.sh make -C test all
+./test/ci/with-ci-env.sh python3 -B test/selftests.py --all-kernels --no-hugetlb --vms 2
+```
+
+The combined report is `/tmp/wprof-selftests-current/report.json`.
 
 ### Add a test and run it on the host kernel in a VM
 
@@ -286,6 +303,8 @@ python3 -B test/selftests.py --ssh 2222 -t 'utrace/test_udp_diag*'
 Connect to the VM via one of the following commands:
 - `vng --ssh-client 2222 --ssh-tcp`
 - `ssh -F ~/.cache/virtme-ng/.ssh/virtme-ng-ssh.conf -p 2222 virtme-ng`
+- `./test/ci/with-ci-env.sh ssh -p 2222 root@localhost`
+  if VM was started in the CI container.
 
 At the guest prompt, run the guest-local prepared script:
 
@@ -293,3 +312,81 @@ At the guest prompt, run the guest-local prepared script:
 # Encapsulates test selection from the `-t` parameter.
 /tmp/run-selftests.sh
 ```
+
+## GitHub CI integration
+
+### CI environment image
+
+`./test/ci/build-container.sh` builds the local Podman image
+`localhost/wprof-selftests:ci`. It provides Debian Trixie, virtme-ng,
+QEMU, kernel build dependencies, Rust, Cargo and LLVM 21.
+
+The image can be configured to accommodate local runs from the
+environments where access to standard apt repositories is blocked.
+Build script looks for configuration file under the following
+locations:
+- `$WPROF_TEST_CONFIG` environment variable.
+- `${XDG_CONFIG_HOME:-$HOME/.config}/wprof-selftests/config`.
+
+The following can be configured:
+
+```sh
+DEBIAN_MIRROR=<your-debian-mirror>
+APT_PROXY=<proxy-mode>
+APT_CA_FILE=<your-certificate-for-the-mirror>
+```
+
+### with-ci-env.sh
+
+Test harness uses a wrapper script to execute build and test commands
+locally and on CI machines within an identical environment:
+
+`./test/ci/with-ci-env.sh [--ro-dir DIR | --rw-dir DIR]... [--] COMMAND [ARG...]`
+runs a command in the caller's working directory inside the local CI
+environment image using Podman.
+
+The idea is to allow transparent build and test commands execution:
+- Using either the host environment:
+```sh
+make -C test all
+python3 -B test/selftests.py --all-kernels --no-hugetlb --vms 2
+```
+- Or using the CI environment:
+```sh
+./test/ci/build-container.sh
+./test/ci/with-ci-env.sh make -C test all
+./test/ci/with-ci-env.sh python3 -B test/selftests.py --all-kernels --no-hugetlb --vms 2
+```
+
+The wrapper can be executed by an ordinary non-root user and shares
+the following with the host:
+- Networking configuration;
+- one-to-one mount points for the following directories:
+  - Repository checkout (read/write), in order to share `src/wprof`
+    and its build outputs.
+  - Kernel and Cargo build cache
+    (`${XDG_CACHE_HOME:-$HOME/.cache}/wprof-selftests`, read/write).
+  - `/tmp` (read/write), in order to share test run artifacts.
+  - `/boot`, `/lib/modules` (read only), in order to allow booting
+    from the host kernel.
+  - Any directories specified as `--rw-dir DIR`, `--ro-dir`.
+  - `/dev/kvm`.
+
+For example, here is how to use local kernel repository to check out
+source for the kernel bundle from a local repository instead of a
+network mirror:
+
+```sh
+./test/ci/with-ci-env.sh --ro-dir "$HOME/bpf-next" -- \
+    make -C test kernel-v6.16 KERNEL_REPO="$HOME/bpf-next"
+```
+
+### Current GitHub workflow
+
+The `selftests` workflow runs on pull requests and pushes to `master`.
+The workflow is designed to:
+- Execute the tests for each registered kernel bundle.
+- Cache CI environment image.
+- Cache kernel bundle artifacts.
+
+[Selftests workflow](../.github/workflows/selftests.yml)

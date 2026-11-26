@@ -27,7 +27,7 @@ read_recipe() {
         files+=("$(realpath --relative-to="$test_dir" -- "$profile")")
     fi
     checksums=$(cd "$test_dir" && sha256sum -- "${files[@]}")
-    inputs=("tag=$tag" "revision=$revision" "features=$features" "configs=$#" "$checksums")
+    inputs=("tag=$tag" "revision=$revision" "features=$features" "configs=$#" "$checksums" "" "WPROF_IMAGE_ID=${WPROF_IMAGE_ID:-}")
 }
 
 checkout_source() {
@@ -59,7 +59,7 @@ build_kernel() {
         "$source_dir/scripts/kconfig/merge_config.sh" -m -O "$build_dir" "$build_dir/.config" "${configs[@]}"
     )
     make "${make_args[@]}" olddefconfig
-    make "${make_args[@]}" -j bzImage modules
+    make "${make_args[@]}" "-j${KERNEL_JOBS:-}" bzImage modules
 }
 
 install_bundle() {
@@ -80,6 +80,12 @@ install_bundle() {
     printf '%s\n' "$features" > "$bundle/features"
     printf '%s\n' "${inputs[@]}" > "$marker"
 }
+
+if [[ $1 == --print-key ]]; then
+    read_recipe "${@:2}"
+    printf '%s\n' "${inputs[@]}" | sha256sum | cut -d' ' -f1
+    exit 0
+fi
 
 read_recipe "$@"
 if printf '%s\n' "${inputs[@]}" | cmp -s - "$marker"; then

@@ -553,6 +553,16 @@ def run_tests_on_host(options: argparse.Namespace, shared_dir: Path,
 
 
 def prepare_ssh_guest(shared_dir: Path, guest_command: list[str], ssh: int) -> list[str]:
+    if os.environ.get("WPROF_IMAGE_ID"):
+        key = Path.home() / ".ssh/id_ed25519"
+        if not key.exists():
+            key.parent.mkdir(mode=0o700, exist_ok=True)
+            subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", key], check=True)
+        connect_hint = f"  ./test/ci/with-ci-env.sh ssh -p {ssh} root@localhost"
+    else:
+        connect_hint = (f"  vng --ssh-client {ssh} --ssh-tcp\n"
+                        f"  ssh -F ~/.cache/virtme-ng/.ssh/virtme-ng-ssh.conf -p {ssh} virtme-ng")
+
     script = shared_dir / "run-selftests.sh"
     script.write_text(
         "#!/bin/sh\n"
@@ -568,8 +578,7 @@ def prepare_ssh_guest(shared_dir: Path, guest_command: list[str], ssh: int) -> l
         f"cp {shlex.quote(str(script))} /tmp/run-selftests.sh\n"
         "chmod +x /tmp/run-selftests.sh\n"
         "echo 'VM started, to connect:'\n"
-        f"echo '  vng --ssh-client {ssh} --ssh-tcp'\n"
-        f"echo '  ssh -F ~/.cache/virtme-ng/.ssh/virtme-ng-ssh.conf -p {ssh} virtme-ng'\n"
+        f"echo '{connect_hint}'\n"
         "echo 'To execute the tests, run /tmp/run-selftests.sh inside the guest.'\n"
         "echo 'Press Ctrl-C in the launcher terminal to stop the VM.'\n"
         "exec sleep infinity\n"

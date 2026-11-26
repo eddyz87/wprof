@@ -3,6 +3,7 @@
 
 KERNEL_TAGS := v6.16 v6.18
 KERNEL_TARGETS := $(addprefix kernel-,$(KERNEL_TAGS))
+KERNEL_KEY_TARGETS := $(addprefix kernel-key-,$(KERNEL_TAGS))
 COMMON_CONFIGS := kernel/vm.config kernel/features.config
 CACHE_DIR ?= $(or $(XDG_CACHE_HOME),$(HOME)/.cache)/wprof-selftests
 KERNEL_REPO ?= https://github.com/torvalds/linux.git
@@ -11,7 +12,7 @@ ifeq ($(strip $(CACHE_DIR)),)
 $(error CACHE_DIR must name a directory)
 endif
 
-.PHONY: all wprof kernels list-kernel-tags $(KERNEL_TARGETS)
+.PHONY: all wprof kernels list-kernel-tags $(KERNEL_TARGETS) $(KERNEL_KEY_TARGETS)
 all: wprof kernels
 
 wprof:
@@ -33,7 +34,10 @@ kernel-v6.18: profile :=
 kernel-v6.18: features :=
 
 $(KERNEL_TARGETS): kernel-%:
-	@./ci/build-kernels.sh "$(CACHE_DIR)" "$*" "$(KERNEL_REPO)" "$(revision)" "$(profile)" "$(features)" $(configs)
+	@./ci/build-kernels.sh $(kernel_build_flags) "$(CACHE_DIR)" "$*" "$(KERNEL_REPO)" "$(revision)" "$(profile)" "$(features)" $(configs)
+
+$(KERNEL_KEY_TARGETS): kernel-key-%:
+	@$(MAKE) -s --no-print-directory kernel-$* kernel_build_flags=--print-key
 
 CLEAN_KERNELS := $(addprefix clean-,$(KERNEL_TARGETS))
 .PHONY: clean clean-kernels clean-sources clean-all $(CLEAN_KERNELS)
