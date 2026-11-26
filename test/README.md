@@ -388,5 +388,7 @@ The workflow is designed to:
 - Execute the tests for each registered kernel bundle.
 - Cache CI environment image.
 - Cache kernel bundle artifacts.
+- Cache blazesym build artifacts and build artifacts for
+  `src/*/Cargo.toml` dependencies.
 
 [Selftests workflow](../.github/workflows/selftests.yml)

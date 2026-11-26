@@ -133,6 +133,52 @@ jobs:
           key: ${{ steps.kernel.outputs.key }}
           path: ${{ steps.kernel.outputs.path }}
 
+      - name: Get Rust cache keys
+        id: rust-keys
+        env:
+          DEPS_HASH: ${{ hashFiles('src/*/Cargo.toml', 'src/*/Cargo.lock') }}
+        run: |
+          image=$(./test/ci/with-ci-env.sh printenv WPROF_IMAGE_ID)
+          revision=$(git rev-parse HEAD:blazesym)
+          echo "blazesym=wprof-blazesym-v1-$image-$revision" >> "$GITHUB_OUTPUT"
+          echo "deps=wprof-rust-deps-v1-$image-$DEPS_HASH" >> "$GITHUB_OUTPUT"
+
+      - name: Cache blazesym build
+        uses: actions/cache@v5
+        with:
+          path: blazesym/target
+          key: ${{ steps.rust-keys.outputs.blazesym }}-${{ hashFiles('src/Makefile') }}
+
+      - name: Restore in-tree Rust dependencies
+        id: rust-deps
+        uses: actions/cache/restore@v5
+        with:
+          path: src/*/target
+          key: ${{ steps.rust-keys.outputs.deps }}
+
+      - name: Build in-tree Rust dependencies
+        if: steps.rust-deps.outputs.cache-hit != 'true'
+        run: |
+          ci=./test/ci/with-ci-env.sh
+          for manifest in src/*/Cargo.toml; do
+              # `cargo tree` command prints out crate dependencies as "<depth> <dep> <version>":
+              #   0 wpb-c v0.1.0 (/.../src/wpb)
+              #   1 prost v0.14.3
+              #   1 rustc-hash v2.1.2
+              "$ci" cargo tree --manifest-path "$manifest" --locked --depth 1 --edges normal --prefix depth --format ' {p}' |
+                  # For each first level dependency extract a string like `-p prost@0.14.3`.
+                  awk '$1 == 1 { print "-p", $2 "@" substr($3, 2) }' |
+                  # Ask cargo to build the depdendencies; xargs -r skips build command if deps list is empty.
+                  xargs -r "$ci" cargo build --manifest-path "$manifest" --locked --release --lib
+          done
+
+      - name: Cache in-tree Rust dependencies
+        if: steps.rust-deps.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: src/*/target
+          key: ${{ steps.rust-keys.outputs.deps }}
+
       - name: Build wprof
         run: ./test/ci/with-ci-env.sh make -C test wprof
 
