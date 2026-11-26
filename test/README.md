@@ -4,6 +4,8 @@
 
 Test harness consists of the following components:
 - [`test/selftests.py`](selftests.py) - the launcher script.
+- [`test/cases/*.py`](cases/) - Python modules containing the test
+  case definitions.
 
 Tests are ordinary Python functions grouped into modules under `test/cases/*.py`.
 These functions are supposed to:
@@ -67,6 +69,11 @@ Invoke the launcher as `python3 -B test/selftests.py [options]`.
 |--------------------------------|----------------------------------------------------------------------------|
 | `-t GLOB`                      | Match the `test/cases/*.py` base file name without `.py`. Defaults to `*`. |
 | `-t GLOB/GLOB`                 | First glob matches the file name, second glob matches the function.        |
+
+For example:
+- `-t 'utrace/test_vfs_write_inline_and_outline'`
+- `-t 'utrace/*vfs_write*'`
+- `-t '*/*vfs_write*'`
 
 ### Filesystem configuration
 
