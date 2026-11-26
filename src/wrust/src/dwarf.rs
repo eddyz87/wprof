@@ -432,8 +432,9 @@ fn load_vmlinux(func_names: &HashSet<&str>) -> Option<DwarfInfo> {
     let uts = unsafe { uts.assume_init() };
     let release = unsafe { CStr::from_ptr(uts.release.as_ptr()) }.to_string_lossy();
     let paths = [
-        format!("/boot/vmlinux-{release}"),
         format!("/usr/lib/modules/{release}/vmlinux-{release}"),
+        format!("/usr/lib/modules/{release}/build/vmlinux"),
+        format!("/boot/vmlinux-{release}"),
     ];
 
     for path in paths {

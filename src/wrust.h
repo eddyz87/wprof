@@ -64,8 +64,9 @@ struct dwarf_info;
 /*
  * Parses DWARF from a vmlinux ELF and creates a dwarf_info instance with information
  * about functions listed in @func_names. Looks for vmlinux in the following locations:
- * - /boot/vmlinux-$(uname -r)
  * - /usr/lib/modules/$(uname -r)/vmlinux-$(uname -r)
+ * - /usr/lib/modules/$(uname -r)/build/vmlinux
+ * - /boot/vmlinux-$(uname -r)
  *
  * Returns NULL if no vmlinux was found or if there was an error while reading DWARF.
  * DWARF parsing errors are logged.
