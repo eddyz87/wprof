@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Kernel test harness using only the Python standard library."""
 from collections import defaultdict
-from collections.abc import Callable, Hashable, Mapping
+from collections.abc import Callable, Hashable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, chdir, contextmanager
 from dataclasses import asdict, dataclass, field
@@ -254,10 +254,11 @@ def load_case_modules():
 @dataclass
 class TestResult:
     name: str
-    artifacts: str | None  # Relative to the run directory; None after cleanup.
+    artifacts: str | None  # Relative to this report's artifact root. None after cleanup.
     outcome: str = "passed"
     complete: bool = False
     details: list[str] = field(default_factory=list)
+    kernel_tag: str | None = None
 
 
 @dataclass
@@ -278,10 +279,12 @@ def read_report(path: Path) -> ReportData:
 
 # Save progress as we go so an interrupted run leaves a partial report.
 class RunReport:
-    def __init__(self, path: Path | None, artifact_root: Path, *, keep_artifacts: bool = False):
+    def __init__(self, path: Path | None, artifact_root: Path, *, kernel_tag: str | None = None,
+                 keep_artifacts: bool = False):
         self.path = path
         self.artifact_root = artifact_root
         self.keep_artifacts = keep_artifacts
+        self.kernel_tag = kernel_tag
         self.data = ReportData()
         self.start = time.monotonic()
         self.boot_uptime = None
@@ -294,7 +297,8 @@ class RunReport:
         if self.boot_uptime is None:
             self.boot_uptime = time.clock_gettime(time.CLOCK_BOOTTIME)
         self.test_start = time.monotonic()
-        record = TestResult(name=name, artifacts=str(directory.relative_to(self.artifact_root)))
+        record = TestResult(name=name, artifacts=str(directory.relative_to(self.artifact_root)),
+                            kernel_tag=self.kernel_tag)
         self.data.results.append(record)
         # Leave an incomplete record if the process or VM dies during this test.
         self.write()
@@ -335,15 +339,17 @@ def runner_main(args: list[str]) -> int:
     parser = argparse.ArgumentParser(prog="selftests.py --runner", fromfile_prefix_chars="@")
     parser.add_argument("tests", nargs="+")
     parser.add_argument("--report-json", type=Path)
-    parser.add_argument("--run-dir", type=Path, help="run directory for test artifacts (default: a new temporary directory)")
+    parser.add_argument("--kernel", default="host-no-vm", help="kernel label for reporting (default: %(default)s)")
+    parser.add_argument("--artifact-root", type=Path, metavar="DIR",
+                        help="directory for test artifacts (default: a new temporary directory)")
     parser.add_argument("--keep-artifacts", action="store_true")
     parser.add_argument("--wprof", type=Path, default=TEST_DIR.parent / "src/wprof")
     parser.add_argument("-v", "--verbose", action="count", default=0)
     options = parser.parse_args(args)
     logging.basicConfig(level=logging.INFO if options.verbose else logging.WARNING, format="%(message)s")
-    run_dir = options.run_dir.resolve() if options.run_dir else Path(mkdtemp(prefix="wprof-runner-"))
-    report = RunReport(options.report_json.resolve() if options.report_json else None,
-                       run_dir, keep_artifacts=options.keep_artifacts)
+    artifact_root = options.artifact_root.resolve() if options.artifact_root else Path(mkdtemp(prefix="wprof-runner-"))
+    report = RunReport(options.report_json.resolve() if options.report_json else None, artifact_root,
+                       kernel_tag=options.kernel, keep_artifacts=options.keep_artifacts)
     try:
         load_case_modules()
         for name in options.tests:
@@ -356,10 +362,10 @@ def runner_main(args: list[str]) -> int:
         return report.finish()
     report.write()
     binary = options.wprof.resolve()
-    run_dir.mkdir(parents=True, exist_ok=True)
+    artifact_root.mkdir(parents=True, exist_ok=True)
     try:
         for name in options.tests:
-            run_test(name, binary, run_dir, report)
+            run_test(name, binary, report)
     except Exception:
         message = traceback.format_exc()
         print(message, file=sys.stderr)
@@ -367,12 +373,20 @@ def runner_main(args: list[str]) -> int:
     return report.finish()
 
 
-TESTS: dict[str, Callable[[Sh], None]] = {}
+@dataclass
+class TestCase:
+    run: Callable[[Sh], None]
+    requires: frozenset[str]
 
 
-def test(function: Callable[[Sh], None]):
-    TESTS[test_name(function)] = function
-    return function
+TESTS: dict[str, TestCase] = {}
+
+
+def test(function=None, *, requires: Sequence[str] = ()):
+    def register(fn: Callable[[Sh], None]):
+        TESTS[test_name(fn)] = TestCase(fn, frozenset(requires))
+        return fn
+    return register if function is None else register(function)
 
 
 def test_name(function: Callable[[Sh], None]) -> str:
@@ -380,14 +394,14 @@ def test_name(function: Callable[[Sh], None]) -> str:
     return f"{path.stem}/{function.__name__}"
 
 
-def run_test(name, binary, run_dir, report):
-    directory = run_dir / name.replace("/", "-")
+def run_test(name, binary, report):
+    directory = report.artifact_root / name.replace("/", "-")
     directory.mkdir()
     record = report.begin(name, directory)
     try:
         with capture_output(directory), chdir(directory), Sh(directory, binary) as sh:
             try:
-                TESTS[name](sh)
+                TESTS[name].run(sh)
             except Exception:
                 traceback.print_exc()
                 raise
@@ -510,9 +524,9 @@ def read_vm_report(path: Path, expected: list[str]) -> ReportData:
         return ReportData(errors=[f"{path}: {err}"])
 
 
-def collect_tests(options: argparse.Namespace) -> list[str]:
+def collect_tests(pattern: str) -> list[str]:
     load_case_modules()
-    return [name for name in TESTS if match_test_name(name, options.test_pattern)]
+    return [name for name in TESTS if match_test_name(name, pattern)]
 
 
 def write_report(final_report: Path, report: ReportData) -> None:
@@ -526,7 +540,7 @@ def write_report(final_report: Path, report: ReportData) -> None:
 def run_tests_on_host(options: argparse.Namespace, shared_dir: Path,
                       tests: list[str], final_report: Path) -> ReportData:
     runner_args = [*tests, "--wprof", str(options.wprof.resolve()), *(["-v"] * options.verbose),
-                   "--run-dir", str(shared_dir),
+                   "--artifact-root", str(shared_dir),
                    "--report-json", str(final_report),
                    *(["--keep-artifacts"] if options.keep_artifacts else [])]
     runner_main(runner_args)
@@ -579,7 +593,7 @@ def prepare_ssh_guest(shared_dir: Path, guest_command: list[str], ssh: int) -> l
 #
 # Test names go in an argument file (vm-N.args):
 #
-#   --run-dir
+#   --artifact-root
 #   /tmp/wprof-selftests-current
 #   --report-json
 #   /tmp/wprof-selftests-current/report-vm0.json
@@ -594,13 +608,8 @@ def prepare_ssh_guest(shared_dir: Path, guest_command: list[str], ssh: int) -> l
 #       --exec '/usr/bin/python3.11 -B -u \
 #       /work/wprof/test/selftests.py --runner @/tmp/wprof-selftests-current/vm-0.args'
 def run_tests_in_vm(options: argparse.Namespace, shared_dir: Path,
-                    tests: list[str]) -> ReportData:
-    if options.kernel:
-        kernel = Path(options.kernel)
-    # With no kernel selection arguments, boot the host's installed image.
-    else:
-        kernel = Path(f"/boot/vmlinuz-{os.uname().release}")
-
+                    tests: list[str], *, kernel: Path, tag: str | None) -> ReportData:
+    kernel_label = f"@{tag}" if tag else options.kernel or "host-vm"
     vm_count = min(options.vms, len(tests))
     batches = [tests[i::vm_count] for i in range(vm_count)]
     hugetlb = not options.no_hugetlb and hugetlb_available()
@@ -620,9 +629,11 @@ def run_tests_in_vm(options: argparse.Namespace, shared_dir: Path,
                     (shared_dir / f"report-vm{vm_id}.json").unlink(missing_ok=True)
                     runner_args = [
                         "--wprof", str(options.wprof.resolve()),
+                        # Keep @RECIPE inside the option so argparse won't read it as an argument file.
+                        f"--kernel={kernel_label}",
                         *(["-v"] * options.verbose),
                         *(["--keep-artifacts"] if options.keep_artifacts else []),
-                        "--run-dir", str(shared_dir),
+                        "--artifact-root", str(shared_dir),
                         "--report-json", str(shared_dir / f"report-vm{vm_id}.json"),
                         *batch,
                     ]
@@ -667,7 +678,10 @@ def run_tests_in_vm(options: argparse.Namespace, shared_dir: Path,
             maybe_show_hugetlb_warning(log_path)
         if status != 0 and not report.failed():
             report.errors.append(f"VM exited unsuccessfully; see {log_path}")
-        results.extend(report.results)
+        for result in report.results:
+            if tag and result.artifacts is not None:
+                result.artifacts = f"{tag}/{result.artifacts}"
+            results.append(result)
         errors.extend(f"VM {vm_id}: {error}" for error in report.errors)
     report = ReportData(results=results, errors=errors, complete=True)
     for vm_id in range(vm_count):
@@ -688,13 +702,40 @@ def prepare_run_directory(base: Path) -> Path:
     return current
 
 
-def print_summary(report: ReportData) -> None:
+def read_bundle_features(bundle: Path) -> set[str]:
+    marker = bundle / "build-inputs"
+    if not marker.is_file():
+        raise ValueError(f"missing {marker}")
+    release = (bundle / "release").read_text().strip()
+    modules = bundle / "lib/modules" / release
+    for path in (bundle / ".config", bundle / "bzImage", modules / f"vmlinux-{release}", modules / "modules.dep"):
+        if not path.is_file():
+            raise ValueError(f"missing {path}")
+    return set((bundle / "features").read_text().split())
+
+
+def select_tests(matched: list[str], tag: str | None, pattern: str, features: set[str]) -> list[str]:
+    selected = [name for name in matched if TESTS[name].requires <= features]
+    label = f"{tag}: " if tag else ""
+    if not selected:
+        missing = sorted({feature for name in matched for feature in TESTS[name].requires - features})
+        print(f"{label}no eligible tests for {pattern!r}; missing kernel features: {', '.join(missing)}")
+        return selected
+
+    print(f"{label}selected tests: {len(selected)}", flush=True)
+    for name in selected:
+        logging.info("%s%s", label, name)
+    return selected
+
+
+def print_summary(report: ReportData, tag: str | None) -> None:
+    label = f"{tag}: " if tag else ""
     counts = {outcome: sum(r.complete and r.outcome == outcome for r in report.results)
               for outcome in ("passed", "failed", "skipped")}
-    print(f"{counts['passed']} passed, {counts['failed']} failed, {counts['skipped']} skipped, "
+    print(f"{label}{counts['passed']} passed, {counts['failed']} failed, {counts['skipped']} skipped, "
           f"{len(report.errors)} infrastructure errors")
     for error in report.errors:
-        logging.error("%s", error)
+        logging.error("%s%s", label, error)
 
 
 def launcher_main(args: list[str]) -> int:
@@ -707,15 +748,22 @@ def launcher_main(args: list[str]) -> int:
                         help="match FILE or FILE/FUNCTION globs, without the file extension (default: all)")
     parser.add_argument("--wprof", type=Path, default=TEST_DIR.parent / "src/wprof",
                         help="wprof binary to test (default: src/wprof)")
+    cache_home = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache")
+    parser.add_argument("--cache-dir", type=Path, metavar="DIR", default=cache_home / "wprof-selftests",
+                        help="cache containing the kernel bundles built by Make (default: %(default)s)")
     parser.add_argument("--basetemp", type=Path, default=Path("/tmp"),
                         help="parent of wprof-selftests-current and wprof-selftests-previous (default: /tmp)")
     parser.add_argument("--keep-artifacts", action="store_true", help="keep artifacts for passing tests too")
-    parser.add_argument("--no-vm", action="store_true", help="run tests on the host instead of starting VMs")
     parser.add_argument("--ssh", nargs="?", type=int, const=2222, metavar="N",
                         help="prepare one VM for manual testing over SSH (default: 2222); disable VM timeout")
     parser.add_argument("--vms", type=int, default=1, help="maximum parallel VMs (default: 1)")
-    parser.add_argument("--kernel", metavar="IMAGE|DIR",
-                        help="guest boot image or kernel build directory (default: host's installed image)")
+    selection = parser.add_mutually_exclusive_group()
+    selection.add_argument("--no-vm", action="store_true", help="run tests on the host instead of starting VMs")
+    selection.add_argument("--kernel", metavar="IMAGE|DIR|@RECIPE",
+                           help="boot an image, build tree or managed bundle (default: host's installed image)")
+    selection.add_argument("--all-kernels", action="store_true", help="run eligible tests on each configured kernel")
+    parser.add_argument("--kernel-features", nargs="*", metavar="GLOB",
+                        help="override available kernel features with space-separated names or globs")
     parser.add_argument("--vm-cpus", type=int, default=2, help="CPUs per VM (default: 2)")
     parser.add_argument("--vm-memory", type=float, default=4.0, help="memory per VM in GiB (default: 4)")
     parser.add_argument("--no-hugetlb", action="store_true", help="disable hugepage backing for guest RAM")
@@ -728,39 +776,95 @@ def launcher_main(args: list[str]) -> int:
             parser.error("--ssh must be a TCP port between 1 and 65535")
         if options.no_vm:
             parser.error("--ssh cannot be combined with --no-vm")
+        if options.all_kernels:
+            parser.error("--ssh requires a single target")
         options.vms = 1
     if not options.no_vm and (options.vms < 1 or options.vm_cpus < 1 or
                               options.vm_memory <= 0 or options.vm_timeout <= 0):
         parser.error("--vms, --vm-cpus, --vm-memory and --vm-timeout must be positive")
     logging.basicConfig(level=logging.INFO if options.verbose > 0 else logging.WARNING, format="%(message)s")
 
+    options.cache_dir = options.cache_dir.resolve()
+    bundle_tag = options.kernel[1:] if options.kernel and options.kernel.startswith("@") else None
+    if options.all_kernels or bundle_tag is not None:
+        try:
+            tags = subprocess.check_output(["make", "-s", "--no-print-directory", "-C", TEST_DIR, "list-kernel-tags"],
+                                           text=True).splitlines()
+        except (OSError, subprocess.CalledProcessError) as err:
+            parser.error(f"cannot list kernel recipes: {err}")
+        if bundle_tag is not None and bundle_tag not in tags:
+            parser.error(f"unknown kernel recipe {bundle_tag!r}; choose from {', '.join(tags)}")
+
     shared_dir = prepare_run_directory(options.basetemp)
     final_report = options.report_json.resolve() if options.report_json else shared_dir / "report.json"
     try:
-        selected = collect_tests(options)
+        matched = collect_tests(options.test_pattern)
     except Exception as err:
         logging.exception("Cannot collect tests")
         failure = ReportData(errors=[f"Test collection failed: {err}"], complete=True)
         write_report(final_report, failure)
         return 1
 
-    if not selected:
+    def run_for_tag(tag: str | None) -> ReportData:
+        features: set[str] = set()
+        if tag:
+            bundle = options.cache_dir / "bundles" / tag
+            kernel = bundle / "bzImage"
+            try:
+                features = read_bundle_features(bundle)
+            except (OSError, ValueError) as err:
+                make = ["make", "-C", str(TEST_DIR), f"CACHE_DIR={options.cache_dir}"]
+                clean = shlex.join([*make, f"clean-kernel-{tag}"])
+                build = shlex.join([*make, f"kernel-{tag}"])
+                message = (f"Incomplete kernel bundle: {err}.\n"
+                           f"Run {clean} &&\n"
+                           f"    {build}")
+                return ReportData(errors=[message], complete=True)
+        else:
+            kernel = Path(options.kernel or f"/boot/vmlinuz-{os.uname().release}")
+        if options.kernel_features is not None:
+            features = {feature for name in matched for feature in TESTS[name].requires
+                        if any(fnmatchcase(feature, pattern) for pattern in options.kernel_features)}
+        selected = select_tests(matched, tag, options.test_pattern, features)
+        if not selected:
+            return ReportData(complete=True)
+        directory = shared_dir / tag if tag else shared_dir
+        try:
+            directory.mkdir(exist_ok=True)
+            if options.no_vm:
+                return run_tests_on_host(options, directory, selected, final_report)
+            else:
+                return run_tests_in_vm(options, directory, selected, kernel=kernel, tag=tag)
+        except Exception as err:
+            logging.exception("%sfailed to run tests", f"{tag}: " if tag else "")
+            return ReportData(errors=[str(err)], complete=True)
+
+    if not matched:
         print(f"no tests match {options.test_pattern!r}")
         report = ReportData(complete=True)
+        write_report(final_report, report)
+        print_summary(report, bundle_tag)
+    elif options.all_kernels:
+        reports = {}
+        combined = ReportData()
+        for tag in tags:
+            write_report(final_report, combined)
+            report = run_for_tag(tag)
+            reports[tag] = report
+            combined.results.extend(report.results)
+            combined.errors.extend(f"{tag}: {error}" for error in report.errors)
+        combined.complete = True
+        write_report(final_report, combined)
+        for tag, report in reports.items():
+            print_summary(report, tag)
+            for result in report.results:
+                if result.outcome == "failed":
+                    print(f"  {tag} {result.name}")
+        report = combined
     else:
-        print(f"selected tests: {len(selected)}", flush=True)
-        for name in selected:
-            logging.info("%s", name)
-        try:
-            if options.no_vm:
-                report = run_tests_on_host(options, shared_dir, selected, final_report)
-            else:
-                report = run_tests_in_vm(options, shared_dir, selected)
-        except Exception as err:
-            logging.exception("failed to run tests")
-            report = ReportData(errors=[str(err)], complete=True)
-    write_report(final_report, report)
-    print_summary(report)
+        report = run_for_tag(bundle_tag)
+        write_report(final_report, report)
+        print_summary(report, bundle_tag)
     print(f"Report: {final_report} (elapsed time: {time.monotonic() - start:.2f}s)")
     return int(report.failed())
 

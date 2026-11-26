@@ -208,7 +208,7 @@ def test_inet_diag_selector(sh: Sh) -> None:
 # In this kernel, write() reaches an inline vfs_write expansion and pwrite()
 # calls its standalone body. Syscall exit events provide independent counts;
 # return probes can cover only the standalone body.
-@test
+@test(requires=["vfs-write-inlined"])
 def test_vfs_write_inline_and_outline(sh: Sh) -> None:
     writer, pwriter = write_workers(sh)
     process, artifacts = sh.wprof(
@@ -261,7 +261,7 @@ def test_vfs_write_inline_and_outline(sh: Sh) -> None:
 # Preserve native span behavior without an entry probe requesting DWARF indexing.
 # pwrite() calls the standalone vfs_write, producing paired entry/exit events
 # with a byte count and result. The inline write() path has no span to attach to.
-@test
+@test(requires=["vfs-write-inlined"])
 def test_vfs_write_span(sh: Sh) -> None:
     writer, pwriter = write_workers(sh)
     process, artifacts = sh.wprof(
@@ -310,7 +310,7 @@ def test_vfs_write_span(sh: Sh) -> None:
 # Exercise span filtering after another spec populates the DWARF function index.
 # The entry probe finds inline and standalone vfs_write bodies; both span legs
 # must exclude inline bodies while retaining argument capture for pwrite().
-@test
+@test(requires=["vfs-write-inlined"])
 def test_vfs_write_span_with_entry_probe(sh: Sh) -> None:
     writer, pwriter = write_workers(sh)
     process, artifacts = sh.wprof(
@@ -365,7 +365,7 @@ def test_vfs_write_span_with_entry_probe(sh: Sh) -> None:
 # Preserve return-probe behavior when no entry probe requests DWARF indexing.
 # Only the standalone vfs_write called by pwrite() has a return site; its return
 # value must still be captured after switching from name to address attachment.
-@test
+@test(requires=["vfs-write-inlined"])
 def test_vfs_write_retprobe(sh: Sh) -> None:
     writer, pwriter = write_workers(sh)
     process, artifacts = sh.wprof(
@@ -402,7 +402,7 @@ def test_vfs_write_retprobe(sh: Sh) -> None:
 # Exercise return-probe filtering with inline records present in the DWARF index.
 # The entry probe indexes both forms of vfs_write; the return probe must exclude
 # inline sites and report the omission once, while pwrite() still yields results.
-@test
+@test(requires=["vfs-write-inlined"])
 def test_vfs_write_retprobe_with_entry_probe(sh: Sh) -> None:
     writer, pwriter = write_workers(sh)
     process, artifacts = sh.wprof(
@@ -578,7 +578,7 @@ def test_udp_diag_wrong_module(sh: Sh) -> None:
 # Exercise nonzero-offset filtering and the legacy address-attachment failure
 # path. On this x86-64 kernel the large offset is outside kernel text. Inline
 # sites must be excluded before the remaining standalone target fails to attach.
-@test
+@test(requires=["vfs-write-inlined"])
 def test_vfs_write_invalid_offset(sh: Sh) -> None:
     process, artifacts = sh.wprof("""
         -d 1s --no-stacks -U 'k:vfs_write+0x7fffffff' -D "$data" -J "$json"

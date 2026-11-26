@@ -6,6 +6,10 @@ Test harness consists of the following components:
 - [`test/selftests.py`](selftests.py) - the launcher script.
 - [`test/cases/*.py`](cases/) - Python modules containing the test
   case definitions.
+- [`Makefile`](Makefile) - build instructions for "kernel bundles",
+  a set of predefined Linux kernel revisions used for testing.
+- [`kernel/`](kernel) - configuration fragments for kernel
+  bundles compilation.
 
 The test harness runs selftests directly on the host or in a VM.
 
@@ -67,6 +71,7 @@ def test_background_write(sh: Sh) -> None:
 Run the test case using the following command:
 
 ```sh
+make -C test wprof
 python3 -B test/selftests.py -t example/test_background_write
 ```
 
@@ -91,29 +96,58 @@ Invoke the launcher as `python3 -B test/selftests.py [options]`.
 ### Kernel selection
 
 By default, the launcher boots `/boot/vmlinuz-$(uname -r)` in a VM.
+Choose at most one of the following options to change the target.
 
 | Option                         | Effect and default                                                                                         |
 |--------------------------------|------------------------------------------------------------------------------------------------------------|
 | `--no-vm`                      | Run the tests directly on the running host kernel. The harness invokes wprof as root or through `sudo -n`. |
-| `--kernel IMAGE\|DIR`          | Boot a VM from an image file or a kernel build directory.                                                 |
+| `--kernel IMAGE\|DIR\|@RECIPE` | Boot a VM from an image file, a kernel build directory, or a named bundle.                                 |
+| `--all-kernels`                | Run eligible tests on each configured bundle in Makefile order.                                            |
+
+`--kernel` accepts three forms:
 
 - **Image file** (`--kernel /boot/vmlinuz-6.16.0`). Boots that image.
   For an installed kernel, the guest uses the matching modules under
   `/lib/modules/<release>/`.
 - **Build directory** (`--kernel ./build`). Boots the kernel from a
   local build after `make bzImage modules`.
+- **Bundle name** (`--kernel @v6.16`). Boots one of the CI kernel bundles.
+  The bundles have to be compiled beforehand (`make -C test kernel-v6.16`).
 
 ### Test filtering
+
+Each test has a set of associated features required by it. A test runs
+when its name matches the filter and the kernel provides all the
+features it requires. For CI kernel bundles the feature set is
+declared in the corresponding [`Makefile`](Makefile) section,
+for `--no-vm`, host kernel and `--kernel` runs the feature set is
+considered empty, but can be overridden by the `--kernel-features`
+parameter.
 
 | Option                         | Effect and default                                                         |
 |--------------------------------|----------------------------------------------------------------------------|
 | `-t GLOB`                      | Match the `test/cases/*.py` base file name without `.py`. Defaults to `*`. |
 | `-t GLOB/GLOB`                 | First glob matches the file name, second glob matches the function.        |
+| `--kernel-features [GLOB ...]` | Replace the available features with names matching the supplied globs.     |
 
 For example:
 - `-t 'utrace/test_vfs_write_inline_and_outline'`
 - `-t 'utrace/*vfs_write*'`
 - `-t '*/*vfs_write*'`
+- Select `v6.16` kernel bundle and execute the tests from
+  `test/cases/utrace.py`, but only if the features required by those
+  tests are provided by the `v6.16` bundle:
+
+```
+python3 -B test/selftests.py --kernel @v6.16 -t 'utrace/*'
+```
+
+- Execute the same tests in the VM using the host's kernel assuming
+  that `vfs-write-inlined` feature is defined:
+
+```
+python3 -B test/selftests.py -t 'utrace/*' --kernel-features vfs-write-inlined
+```
 
 ### VM configuration
 
@@ -128,8 +162,13 @@ For example:
 
 | Option               | Effect and default                                                                         |
 |----------------------|--------------------------------------------------------------------------------------------|
+| `--cache-dir DIR`    | Kernel sources and bundles. Defaults to `${XDG_CACHE_HOME:-$HOME/.cache}/wprof-selftests`. |
 | `--basetemp DIR`     | Base directory for run reports, VM logs and test artifacts. Defaults to `/tmp`.            |
 | `--report-json PATH` | Final JSON report. Defaults to `<basetemp>/wprof-selftests-current/report.json`.           |
+
+Test harness uses `--cache-dir` to check out source code and build CI
+kernel bundles. Each bundle's checkout takes about 2 GB, compiled
+bundle takes about 400 MB.
 
 Each invocation creates a fresh `<basetemp>/wprof-selftests-current`
 If a current directory already exists, the launcher first renames it
@@ -140,9 +179,36 @@ directory layout:
 ```
 wprof-selftests-current/
     report.json
+    v6.16/
+        vm-0.log.gz
+        utrace-test_vfs_write_span/
+            test-stdout.log.gz
+            test-stderr.log.gz
+            wprof-stdout.log.gz
+            wprof-stderr.log.gz
+            trace.json.gz
 ```
 
 By default artifacts are retained only for failing test cases.
+
+Example `report.json` for an `--all-kernels` run:
+
+```json
+{
+  "results": [
+    {
+      "name": "utrace/test_vfs_write_span",
+      "artifacts": "v6.16/utrace-test_vfs_write_span",
+      "outcome": "failed",
+      "complete": true,
+      "details": ["...\n    assert write_count >= 20, ...\nAssertionError: write_count=0"],
+      "kernel_tag": "@v6.16"
+    }
+  ],
+  "errors": ["v6.18: Incomplete kernel bundle: missing .../bundles/v6.18/bzImage.\nRun ..."],
+  "complete": true
+}
+```
 
 ### Other options
 
@@ -153,6 +219,58 @@ By default artifacts are retained only for failing test cases.
 | `--ssh [PORT]`     | Prepare a guest VM for manual testing and disable its timeout. The default SSH port is 2222. |
 | `--keep-artifacts` | Retain per-test artifacts for both failing and passing cases.                                |
 | `--wprof PATH`     | Profiler binary, default `src/wprof` in the checkout.                                        |
+
+## CI kernel bundles
+
+A bundle packages a bootable kernel, its matching modules, debug
+image, and the feature names used to select tests. Bundles are defined
+in the [`test/Makefile`](Makefile) as follows:
+
+```make
+KERNEL_TAGS := v6.16 ...
+...
+kernel-v6.16: revision := 038d61fd642278bab63ee8ef722c50d10ab01e8f
+kernel-v6.16: configs := $(COMMON_CONFIGS) kernel/v6.16/autofdo.config
+kernel-v6.16: profile := kernel/v6.16/vfs_write.prof
+kernel-v6.16: features := vfs-write-inlined
+```
+
+- `revision` pins the Linux Git commit.
+- `configs` lists the kernel configuration fragments to apply on top
+  of `x86_64_defconfig`.
+- `profile` optionally supplies an LLVM sample profile to Kbuild through
+  `CLANG_AUTOFDO_PROFILE`. Here `vfs_write.prof` guides Clang to inline
+  `vfs_write` on the write path.
+- `features` lists the space-separated feature names used for
+  test selection, such as those marked `@test(requires=["vfs-write-inlined"])`.
+
+The following targets are available:
+
+```sh
+make -C test kernel-v6.16       # build the bundle for tag v6.16
+make -C test kernels            # build all bundles
+make -C test wprof              # build wprof
+
+make -C test clean-kernel-v6.16 # remove the bundle for tag v6.16
+make -C test clean-kernels      # remove all configured bundles
+make -C test clean-sources      # remove the kernel source checkouts
+make -C test clean              # remove all configured bundles and run make -C src clean
+make -C test clean-all          # remove all configured bundles and source checkouts and run make -C src clean-all
+```
+
+The kernel series of targets manages kernel source code checkout
+getting the code either from the internet mirror, or from a repository
+specified by the `KERNEL_REPO` variable.
+
+The bundles are compiled and stored under the directory controlled by
+`CACHE_DIR` variable, which defaults to
+`${XDG_CACHE_HOME:-$HOME/.cache}/wprof-selftests`:
+
+```
+<cache>/
+  linux-v6.16/                 source checkout at the pinned revision.
+  bundles/v6.16/               bundle contents.
+```
 
 ## SSH into a VM
 
