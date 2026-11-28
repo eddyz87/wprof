@@ -133,6 +133,14 @@ static inline void wprof_strlcpy(char *dst, const char *src, size_t sz)
 	dst[i] = '\0';
 }
 
+/* Length of prefix if str starts with it, 0 otherwise */
+static inline size_t str_has_prefix(const char *str, const char *prefix)
+{
+	size_t len = strlen(prefix);
+
+	return strncmp(str, prefix, len) == 0 ? len : 0;
+}
+
 const char *sfmt(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 
 const char *libbpf_errstr(int err); /* from libbpf */
@@ -295,8 +303,11 @@ void gen_uuid(char out[UUID_STR_LEN]);
 
 /* ARGS PARSING HELPERS */
 int append_str(char ***strs, int *cnt, const char *str);
+/* Like append_str but w/o strdup(). */
+int append_str_ref(const char ***strs, size_t *cnt, const char *str);
 int append_str_file(char ***strs, int *cnt, const char *file);
 int append_num(int **nums, int *cnt, const char *arg);
 int append_int(int **nums, int *cnt, int val);
+int append_long(unsigned long **nums, size_t *cnt, unsigned long val);
 
 #endif /* __UTILS_H_ */

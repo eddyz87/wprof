@@ -30,6 +30,7 @@
 #include "stacktrace.h"
 #include "ksyms.h"
 #include "utrace_cfg.h"
+#include "utrace.h"
 #include "strs.h"
 #include "../libbpf/src/strset.h"
 #include "../libbpf/src/hashmap.h"
@@ -160,12 +161,12 @@ static void collect_extras(struct persist_state *ps, struct wprof_extra_param **
 	if (env.deny_kthread)
 		add_extra(extras, cnt, WEXTRA_FILTER_KTHREAD_DENY, 0);
 
-	if (env.utrace_cfg_cnt > 0) {
+	if (env.utrace->cfg_cnt > 0) {
 		struct sbuf sb = sbuf_new();
 
-		for (int i = 0; i < env.utrace_cfg_cnt; i++) {
+		for (int i = 0; i < env.utrace->cfg_cnt; i++) {
 			sbuf_reset(&sb);
-			ucfg_format(&env.utrace_cfgs[i], &sb);
+			ucfg_format(&env.utrace->cfgs[i], &sb);
 			add_extra(extras, cnt, WEXTRA_UTRACE_DEF, persist_stroff(ps, sbuf_str(&sb)));
 		}
 
@@ -200,10 +201,12 @@ static void collect_extras(struct persist_state *ps, struct wprof_extra_param **
 		}
 	}
 
-	if (env.prepare_spec_str)
-		add_extra(extras, cnt, WEXTRA_PREPARE_SPEC, persist_stroff(ps, env.prepare_spec_str));
-	if (env.activate_spec_str)
-		add_extra(extras, cnt, WEXTRA_ACTIVATE_SPEC, persist_stroff(ps, env.activate_spec_str));
+	if (env.prepare_spec.str)
+		add_extra(extras, cnt, WEXTRA_PREPARE_SPEC, persist_stroff(ps, env.prepare_spec.str));
+	if (env.activate_spec.str)
+		add_extra(extras, cnt, WEXTRA_ACTIVATE_SPEC, persist_stroff(ps, env.activate_spec.str));
+	if (env.stop_spec.str)
+		add_extra(extras, cnt, WEXTRA_STOP_SPEC, persist_stroff(ps, env.stop_spec.str));
 	if (env.flightrec) {
 		char spec[64];
 		int n = 0;
@@ -601,6 +604,36 @@ static void finalize_stats(struct wprof_stats *s)
 	oublock[0] = ru.ru_oublock;
 	nvcsw[0] = ru.ru_nvcsw;
 	nivcsw[0] = ru.ru_nivcsw;
+}
+
+/*
+ * Set WEF_PYTORCH_LINKED on PyTorch forward ops that a backward op linked to.
+ * Persist only finds that out at the backward op, long after the forward op
+ * was written out, so patch them in place once all events are written.
+ */
+static int flag_linked_fwd_ops(FILE *dump, const struct persist_state *ps, u64 events_sz)
+{
+	size_t sz = sizeof(struct wprof_data_hdr) + events_sz;
+	void *mem;
+
+	if (ps->rf_link_cnt == 0)
+		return 0;
+
+	if (fflush(dump))
+		return -errno;
+
+	mem = mmap(NULL, sz, PROT_READ | PROT_WRITE, MAP_SHARED, fileno(dump), 0);
+	if (mem == MAP_FAILED)
+		return -errno;
+
+	for (int i = 0; i < ps->rf_link_cnt; i++) {
+		struct wevent *e = mem + sizeof(struct wprof_data_hdr) + ps->rf_link_offs[i];
+
+		e->flags |= WEF_PYTORCH_LINKED;
+	}
+
+	munmap(mem, sz);
+	return 0;
 }
 
 /*
@@ -1288,7 +1321,7 @@ skip_pytorch:
 				continue;
 			}
 
-			wevent_sz = persist_pytorch_event(&ps, r, &wevent_buf,
+			wevent_sz = persist_pytorch_event(&ps, r, &wevent_buf, events_sz,
 							  inj->pid, inj->ns_pid, inj->proc_name, wtorch->strs);
 			if (wevent_sz < 0) {
 				eprintf("Failed to convert pytorch event for %s: %d\n", injectee_str(inj), wevent_sz);
@@ -1355,6 +1388,12 @@ skip_pytorch:
 	}
 
 	wpq_free(pq);
+
+	err = flag_linked_fwd_ops(data_dump, &ps, events_sz);
+	if (err) {
+		eprintf("Failed to flag linked PyTorch forward ops: %d\n", err);
+		return err;
+	}
 
 	/* Cleanup BPF ringbuf dumps */
 	for (int i = 0; i < env.ringbuf_cnt; i++) {

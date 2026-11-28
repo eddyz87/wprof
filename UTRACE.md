@@ -55,17 +55,17 @@ wprof -U 'usdt:myapp:request_start (arg:0, pid:nvidia-smi)'
 
 ### Instant probes
 
-| Prefix    | Target spec          | Description                          |
-|-----------|----------------------|--------------------------------------|
-| `u:`      | `func_name[+offset]` | Userspace function entry (uprobe)    |
-| `uret:`   | `func_name`          | Userspace function return (uretprobe)|
-| `usdt:`   | `provider:name`      | User Statically-Defined Tracepoint   |
-| `k:`      | `func_name[+offset]` | Kernel function entry (kprobe)       |
-| `kret:`   | `func_name`          | Kernel function return (kretprobe)   |
-| `tp:`     | `category:name`      | Classic kernel tracepoint            |
-| `raw_tp:` | `name`               | Raw kernel tracepoint (BTF-based)    |
-| `bpf:`    | `prog\|id[:subprog]` | Loaded BPF program entry (fentry)    |
-| `bpfret:` | `prog\|id[:subprog]` | Loaded BPF program return (fexit)    |
+| Prefix    | Target spec                          | Description                           |
+|-----------|--------------------------------------|---------------------------------------|
+| `u:`      | `func_name[+offset]`                 | Userspace function entry (uprobe)     |
+| `uret:`   | `func_name`                          | Userspace function return (uretprobe) |
+| `usdt:`   | `provider:name`                      | User Statically-Defined Tracepoint    |
+| `k:`      | `[module:]func_name[@file][+offset]` | Kernel function entry (kprobe)        |
+| `kret:`   | `[module:]func_name[@file]`          | Kernel function return (kretprobe)    |
+| `tp:`     | `category:name`                      | Classic kernel tracepoint             |
+| `raw_tp:` | `name`                               | Raw kernel tracepoint (BTF-based)     |
+| `bpf:`    | `prog\|id[:subprog]`                 | Loaded BPF program entry (fentry)     |
+| `bpfret:` | `prog\|id[:subprog]`                 | Loaded BPF program return (fexit)     |
 
 ### Span probes (entry + exit pairs)
 
@@ -74,6 +74,25 @@ wprof -U 'usdt:myapp:request_start (arg:0, pid:nvidia-smi)'
 | `uspan:`    | Uprobe + uretprobe on same function  |
 | `kspan:`    | Kprobe + kretprobe on same function  |
 | `bpfspan:`  | BPF fentry + fexit on same function  |
+
+Kernel probes (`k:`, `kret:`, and `kspan:`) accept `[module:]func_name[@file]`.
+Only `k:` accepts a trailing `+offset`.
+The optional module name restricts lookup to that loaded module, for example
+`k:my_module:foo`. Without it, lookup includes vmlinux and all loaded modules.
+If the module name is `vmlinux`, lookup is restricted to functions in the
+main kernel, for example `k:vmlinux:vfs_write`.
+
+The file selector matches a declaration-file suffix, for example
+`k:vfs_write@fs/read_write.c` or `kret:vfs_write@read_write.c`.
+The suffix must start at a '/' boundary. File selectors require
+matching DWARF; probes without a file selector also collect addresses
+from kallsyms. Only vmlinux DWARF is currently indexed.
+
+Zero-offset `k:` probes attach to both inlined (if DWARF is available)
+and non-inlined function instances. Nonzero offsets, `kret:`, `kspan:`,
+and probes capturing arguments attach only to non-inlined functions, as
+inlined instances have no return site and their arguments can't be read.
+wprof warns about the inlined instances it skips.
 
 A `bpf:`/`bpfret:`/`bpfspan:` target names a loaded BPF program's function.
 A bare `prog` name resolves to that function wherever it is loaded. A
@@ -609,3 +628,23 @@ available:
 
 Use `arg:*` to capture all detected arguments with their inferred types
 and names.
+
+## utrace triggers
+
+`--prepare`, `--activate`, and `--stop` can wait for the first hit of a probe,
+given after a `utrace:` (or `ut:`) prefix, instead of a point in time (see the
+README):
+
+```
+wprof --activate 'utrace:usdt:app:iter_start(path:/usr/bin/app)' -d 5s
+wprof --activate 'ut:usdt:libc:setjmp(comm:bash)' -d 5s
+wprof --prepare 'ut:u:main(path:/usr/bin/app)' --activate 'utrace:k:oom_kill_process'
+wprof -F10s --stop 'ut:k:oom_kill_process'
+```
+
+A trigger only needs to know where to attach, so it takes a subset of the probe
+definition: an instant probe target (`u:`, `uret:`, `usdt:`, `k:`, `kret:`,
+`tp:`, `raw_tp:`, `bpf:`, `bpfret:`, with offsets where those allow them) and,
+for uprobe and USDT probes, the `path:`, `pid:`, and `comm:` filters, including
+auto-discovery. Argument and stack capture, settings, and spans are rejected,
+and so is `pid:` on kernel probes, which a regular utrace probe ignores.

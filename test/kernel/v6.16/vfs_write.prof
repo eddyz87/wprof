@@ -1,0 +1,9 @@
+ksys_write:10000:1000
+ 11: vfs_write:10000
+  4: 10000
+__x64_sys_write:10000:1000
+ 0: __se_sys_write:10000
+  0: __do_sys_write:10000
+   3: ksys_write:10000
+    11: vfs_write:10000
+     4: 10000

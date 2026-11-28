@@ -12,7 +12,7 @@
 #include "requests.h"
 #include "utrace_cfg.h"
 
-#define WPROF_VERSION "0.7.1"
+#define WPROF_VERSION "0.8"
 
 #define DEFAULT_RINGBUF_SZ (16 * 1024 * 1024)
 #define DEFAULT_FR_CHUNK_SZ (32 * 1024 * 1024)
@@ -87,38 +87,81 @@ enum pytrace_discover_strategy {
 
 /* session lifecycle, driven by the single epoll control loop in main() */
 enum sess_state {
-	SESS_STANDBY,	/* waiting until prepare time */
+	SESS_STANDBY,	/* waiting for the prepare trigger */
 	SESS_PREP,	/* discovery / injection / BPF setup */
-	SESS_ARMED,	/* waiting until activation (BPF drops events in-kernel) */
+	SESS_ARMED,	/* waiting for the activate trigger (BPF drops events in-kernel) */
 	SESS_RECORDING,	/* collecting until session end */
 	SESS_DONE,	/* leave loop -> post-processing */
 };
 
 /*
  * Session-control epoll tags, stored in epoll_event.data.u32 to identify the
- * ready fd. The fixed timers/signal come first; each watched injectee UDS is
- * tagged CTLS_INJECTEE_UDS_BASE + its injectee index.
+ * ready fd. The fixed triggers/timers/signal come first; each watched injectee
+ * UDS is tagged CTLS_INJECTEE_UDS_BASE + its injectee index.
  */
-enum epoll_tag { CTL_PREP_TIMER, CTL_ACTIVATE_TIMER, CTL_END_TIMER, CTL_SIGNAL, CTLS_INJECTEE_UDS_BASE };
+enum epoll_tag {
+	CTL_PREP_TRIGGER,
+	CTL_ACTIVATE_TRIGGER,
+	CTL_STOP_TRIGGER,
+	CTL_END_TIMER,
+	CTL_SIGNAL,
+	CTLS_INJECTEE_UDS_BASE
+};
+
+/* what starts a session phase (--prepare / --activate) or ends the session (--stop) */
+enum trigger_kind {
+	TRIG_UNSET = 0,	/* option not given: prepare at startup, activate right after prepare */
+	TRIG_TIME,	/* time spec */
+	TRIG_SIGINT,	/* "sig:int": wait for SIGINT */
+	TRIG_UTRACE,	/* utrace:<probe>: wait for its first hit */
+};
+
+struct trigger_spec {
+	enum trigger_kind kind;
+	struct timespec_spec time;	/* TRIG_TIME */
+	struct utrace_cfg *utrace_cfg;	/* TRIG_UTRACE: parsed probe, owned by the trigger once started (then NULL) */
+	char *str;			/* raw CLI spec, persisted via WEXTRA */
+};
+
+static inline bool trigger_is_event(const struct trigger_spec *spec)
+{
+	return spec->kind == TRIG_SIGINT || spec->kind == TRIG_UTRACE;
+}
+
+struct utrace_trigger;
+
+/* trigger of one session phase transition: preparation, activation, or stop */
+struct phase_trigger {
+	const char *phase;		/* "preparation" / "activation" / "stop", for messages */
+	struct trigger_spec *spec;
+	enum epoll_tag tag;		/* CTL_PREP_TRIGGER / CTL_ACTIVATE_TRIGGER / CTL_STOP_TRIGGER */
+	int fd;				/* timerfd for a time, eventfd for sigint, utrace ringbuf fd (or -1) */
+	struct utrace_trigger *utrace_probe;	/* TRIG_UTRACE, while attached */
+};
 
 struct sess_ctl {
 	int epoll_fd;
-	int prep_tfd;
-	int activate_tfd;
+	struct phase_trigger prep_trig;
+	struct phase_trigger activate_trig;
+	struct phase_trigger stop_trig;
 	int sess_end_tfd;
 	int sig_efd;
+	int sigint_fd;		/* trigger eventfd of the phase waiting for SIGINT, or -1; taken by the signal handler */
 	enum sess_state state;
+	bool activate_deferred;	/* --activate time resolves only once the event-triggered prepare fires */
 	bool session_activated;
 	bool session_complete;
 	u64 prepare_target_ts;
 	u64 activate_target_ts;
 	u64 sess_end_target_ts;
+	u64 stopped_ts;		/* when the --stop trigger fired, the recorded window ends there */
 };
 
 struct wprof_bpf;
 struct req_list_cfg;
 struct ksyms;
 struct injectee;
+struct utrace_session;
 
 enum seal_kind {
 	SEAL_FILE_OUTPUT = 1 << 0,	/* --seal file-output (alias --seal-output) */
@@ -147,11 +190,10 @@ struct env {
 	s64 fr_keep_size;	/* -1 until set; resolved in main() */
 	u64 fr_chunk_size;
 
-	/* time-delayed activation (--prepare / --activate) */
-	struct timespec_spec prepare_spec;
-	struct timespec_spec activate_spec;
-	char *prepare_spec_str;		/* raw CLI spec, persisted via WEXTRA */
-	char *activate_spec_str;	/* raw CLI spec, persisted via WEXTRA */
+	/* delayed preparation and activation (--prepare / --activate) */
+	struct trigger_spec prepare_spec;
+	struct trigger_spec activate_spec;
+	struct trigger_spec stop_spec;
 
 	/* for replay only, mutually exclusive with duration_ns */
 	s64 replay_start_offset_ns;
@@ -297,8 +339,7 @@ struct env {
 	bool nv_smi_discovered;
 
 	/* user-defined tracing (utrace) */
-	struct utrace_cfg *utrace_cfgs;
-	int utrace_cfg_cnt;
+	struct utrace_session *utrace;
 
 	/* user-defined metadata (key=value pairs) */
 	char **metadata;

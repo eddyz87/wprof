@@ -18,6 +18,7 @@
 #include "data.h"
 #include "requests.h"
 #include "utrace_cfg.h"
+#include "utrace.h"
 #include "strs.h"
 #include "elf_utils.h"
 #include "inject.h"
@@ -113,6 +114,7 @@ enum {
 	OPT_JSON_SCHEMA = 1018,
 	OPT_PREPARE = 1019,
 	OPT_ACTIVATE = 1020,
+	OPT_STOP = 1021,
 
 	OPT_ALLOW_TID = 2000,
 	OPT_DENY_TID = 2001,
@@ -157,8 +159,9 @@ static const struct argp_option opts[] = {
 	  "comma list of a time and/or size limit, e.g. 10s,1000mb. Bare -F uses "
 	  "1s,1gb; naming one dimension leaves the other unlimited; a 0 token "
 	  "disables a dimension. Mutually exclusive with -d." },
-	{ "prepare", OPT_PREPARE, "WHEN", 0, "Delayed tracing setup, syntax: @now, @<ISO time>, +<dur>, /<dur> (align to next period). Default: at startup" },
+	{ "prepare", OPT_PREPARE, "WHEN", 0, "Delayed tracing setup, syntax: @now, @<ISO time>, +<dur>, /<dur> (align to next period), sig:int (Ctrl-C), utrace:<probe> (or ut:<probe>). Default: at startup" },
 	{ "activate", OPT_ACTIVATE, "WHEN", 0, "Delayed data capture activation; same syntax as --prepare. Default: immediately after prepare" },
+	{ "stop", OPT_STOP, "WHEN", 0, "Stop data capture before -d runs out (required, unless -F); same syntax as --prepare, +<dur> counts from activation" },
 	{ "timer-freq", OPT_TIMER_FREQ, "HZ", 0, "Deprecated: use -Stimer=<freq>hz or -Stimer=<period>. On-CPU timer interrupt frequency (default: 100Hz)" },
 
 	{ "data", 'D', "FILE", 0, "Data dump path (defaults to 'wprof.data' in current directory)" },
@@ -268,6 +271,39 @@ static enum stack_trace_kind parse_stack_kinds(const char *arg)
 
 	eprintf("Unrecognized stack trace kind: '%s'\n", arg);
 	return ST_ERR;
+}
+
+static int parse_trigger(const char *arg, struct trigger_spec *spec)
+{
+	size_t pfx_len;
+	int err;
+
+	if ((pfx_len = str_has_prefix(arg, "sig:"))) {
+		/* only SIGINT so far */
+		if (strcasecmp(arg + pfx_len, "int") != 0) {
+			eprintf("Unsupported trigger signal '%s', only sig:int is supported!\n", arg + pfx_len);
+			return -EINVAL;
+		}
+		spec->kind = TRIG_SIGINT;
+	} else if ((pfx_len = str_has_prefix(arg, "utrace:")) || (pfx_len = str_has_prefix(arg, "ut:"))) {
+		struct utrace_cfg *cfg = calloc(1, sizeof(*cfg));
+
+		err = ucfg_parse_trigger(arg + pfx_len, cfg);
+		if (err) {
+			free(cfg);
+			return err;
+		}
+		spec->kind = TRIG_UTRACE;
+		spec->utrace_cfg = cfg;
+	} else {
+		err = parse_timespec(arg, &spec->time);
+		if (err)
+			return err;
+		spec->kind = TRIG_TIME;
+	}
+
+	spec->str = strdup(arg);
+	return 0;
 }
 
 static error_t parse_arg(int key, char *arg, struct argp_state *state)
@@ -406,18 +442,34 @@ static error_t parse_arg(int key, char *arg, struct argp_state *state)
 		break;
 	}
 	case OPT_PREPARE:
-		if (parse_timespec(arg, &env.prepare_spec)) {
-			fprintf(stderr, "Invalid --prepare time spec: %s\n", arg);
+		if (env.prepare_spec.kind != TRIG_UNSET) {
+			eprintf("--prepare specified more than once!\n");
 			argp_usage(state);
 		}
-		env.prepare_spec_str = strdup(arg);
+		if (parse_trigger(arg, &env.prepare_spec)) {
+			fprintf(stderr, "Invalid --prepare spec: %s\n", arg);
+			argp_usage(state);
+		}
 		break;
 	case OPT_ACTIVATE:
-		if (parse_timespec(arg, &env.activate_spec)) {
-			fprintf(stderr, "Invalid --activate time spec: %s\n", arg);
+		if (env.activate_spec.kind != TRIG_UNSET) {
+			eprintf("--activate specified more than once!\n");
 			argp_usage(state);
 		}
-		env.activate_spec_str = strdup(arg);
+		if (parse_trigger(arg, &env.activate_spec)) {
+			fprintf(stderr, "Invalid --activate spec: %s\n", arg);
+			argp_usage(state);
+		}
+		break;
+	case OPT_STOP:
+		if (env.stop_spec.kind != TRIG_UNSET) {
+			eprintf("--stop specified more than once!\n");
+			argp_usage(state);
+		}
+		if (parse_trigger(arg, &env.stop_spec)) {
+			fprintf(stderr, "Invalid --stop spec: %s\n", arg);
+			argp_usage(state);
+		}
 		break;
 	case 'D':
 		if (env.seals & SEAL_FILE_OUTPUT) {
@@ -1000,7 +1052,7 @@ static error_t parse_arg(int key, char *arg, struct argp_state *state)
 	}
 	/* USER-DEFINED TRACING */
 	case 'U': {
-		int first_cfg = env.utrace_cfg_cnt;
+		int first_cfg = env.utrace->cfg_cnt;
 
 		if (arg[0] == '@') {
 			if (env.seals & SEAL_FILE_INPUT) {
@@ -1015,12 +1067,12 @@ static error_t parse_arg(int key, char *arg, struct argp_state *state)
 			return err;
 		if (!(env.seals & SEAL_UPROBE_ARGS))
 			break;
-		for (int i = first_cfg; i < env.utrace_cfg_cnt; i++) {
-			if (!ucfg_has_uprobe_args(&env.utrace_cfgs[i]))
+		for (int i = first_cfg; i < env.utrace->cfg_cnt; i++) {
+			if (!ucfg_has_uprobe_args(&env.utrace->cfgs[i]))
 				continue;
 
 			struct sbuf sb = sbuf_new();
-			ucfg_format(&env.utrace_cfgs[i], &sb);
+			ucfg_format(&env.utrace->cfgs[i], &sb);
 			fprintf(stderr, "Uprobe argument capture is disabled by --seal uprobe-args: '%s'\n",
 				sbuf_str(&sb));
 			sbuf_free(&sb);

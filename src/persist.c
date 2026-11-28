@@ -14,6 +14,7 @@
 #include "pytrace_data.h"
 #include "pytorch_data.h"
 #include "utrace_cfg.h"
+#include "utrace.h"
 #include "proc.h"
 #include "../libbpf/src/strset.h"
 #include "../libbpf/src/hashmap.h"
@@ -72,6 +73,8 @@ int persist_state_init(struct persist_state *ps, int pmu_cnt)
 
 	ps->tid_cache = hashmap__new(hash_identity_fn, hash_equal_fn, NULL);
 	ps->thread_states = hashmap__new(hash_identity_fn, hash_equal_fn, NULL);
+	ps->rf_tasks = hashmap__new(hash_identity_fn, hash_equal_fn, NULL);
+	ps->rf_fwds = hashmap__new(hash_identity_fn, hash_equal_fn, NULL);
 
 	return 0;
 }
@@ -103,6 +106,9 @@ void persist_state_free(struct persist_state *ps)
 			free(entry->pvalue);
 		hashmap__free(ps->thread_states);
 	}
+	hashmap__free(ps->rf_tasks);
+	hashmap__free(ps->rf_fwds);
+	free(ps->rf_link_offs);
 }
 
 int persist_stroff(struct persist_state *ps, const char *str)
@@ -214,7 +220,7 @@ int persist_add_pmu_def(struct persist_state *ps, const struct pmu_event *ev)
 static void fill_wevent_hdr(struct wevent *dst, const struct wprof_event *e, u32 task_id, u16 sz)
 {
 	dst->sz = sz;
-	dst->flags = e->flags;
+	dst->flags = 0;
 	dst->kind = e->kind;
 	dst->task_id = task_id;
 	dst->cpu = e->cpu;
@@ -510,7 +516,7 @@ int persist_bpf_event(struct persist_state *ps, const struct wprof_event *e, str
 	case EV_UTRACE_ENTRY:
 	case EV_UTRACE_EXIT: {
 		u32 utrace_id = e->utrace.utrace_id;
-		const struct utrace_cfg *cfg = &env.utrace_cfgs[utrace_id];
+		const struct utrace_cfg *cfg = &env.utrace->cfgs[utrace_id];
 		/*
 		 * Native spans split one cfg's args across entry/exit by ret-ness; a
 		 * generic ~~ span uses the firing leg and keeps all of that leg's args.
@@ -649,7 +655,7 @@ static void fill_cuda_wevent_hdr(struct wevent *dst, const struct wcuda_event *e
 				 enum event_kind kind, u32 task_id, u16 sz)
 {
 	dst->sz = sz;
-	dst->flags = e->flags;
+	dst->flags = 0;
 	dst->kind = kind;
 	dst->task_id = task_id;
 	dst->cpu = 0;
@@ -819,8 +825,14 @@ int persist_pytrace_event(struct persist_state *ps, const struct wpytrace_event 
 	return dst->sz;
 }
 
+static long rf_fwd_key(u32 task_id, s64 seq)
+{
+	return hash_mix64(task_id) ^ seq;
+}
+
+/* off is where dst will be written, relative to the start of events */
 int persist_pytorch_event(struct persist_state *ps, const struct wpytorch_event *e, struct wevent *dst,
-			  int host_pid, int ns_pid, const char *proc_name, const char *strs)
+			  u64 off, int host_pid, int ns_pid, const char *proc_name, const char *strs)
 {
 	/* resolve the (possibly namespaced) tid to a task */
 	struct tid_cache_value *ti = resolve_cuda_host_tid(ps, host_pid, proc_name, ns_pid, e->tid);
@@ -830,9 +842,51 @@ int persist_pytorch_event(struct persist_state *ps, const struct wpytorch_event 
 	dst->cpu = 0;
 	dst->numa_node = 0;
 	dst->ts = e->ts;
-	dst->sz = WEVENT_SZ(rf);
-	dst->kind = (e->what == WPYTORCH_ENTRY) ? EV_PYTORCH_ENTRY : EV_PYTORCH_EXIT;
+	dst->sz = WEVENT_RF_SZ;
+	dst->kind = (e->what == WPYTORCH_EXIT) ? EV_PYTORCH_EXIT : EV_PYTORCH_ENTRY;
 	dst->rf.name_stroff = e->name_off ? persist_stroff(ps, strs + e->name_off) : 0;
+
+	/*
+	 * Map RecordFunction thread ids to tasks: a forward op's thread is known
+	 * from the forward op itself, which merges in before any backward op of
+	 * the autograd node it created. If it isn't known, the forward op wasn't
+	 * captured and there is nothing to link the backward op to.
+	 *
+	 * Ops arrive in start time order. Of all the forward ops sharing a
+	 * sequence number, the last one to start is the one that created the
+	 * autograd node, so each forward op replaces the candidate for its key.
+	 * All of them start before the node is created and its backward op can
+	 * only start after that, so the first backward op with a matching key
+	 * claims the right candidate. That forward op is already written out by
+	 * then, so it is flagged later, see rf_link_offs.
+	 */
+	if (e->what == WPYTORCH_ENTRY_SEQ) {
+		long fwd_task_id = 0, fwd_off;
+
+		if (e->rf_tid > 0) {
+			if (ti->task_id) {
+				hashmap__set(ps->rf_tasks, ((u64)host_pid << 32) | (u32)e->rf_tid, ti->task_id, NULL, NULL);
+				hashmap__set(ps->rf_fwds, rf_fwd_key(ti->task_id, e->seq_nr), off, NULL, NULL);
+			}
+		} else {
+			if (!hashmap__find(ps->rf_tasks, ((u64)host_pid << 32) | (u32)-e->rf_tid, &fwd_task_id))
+				return dst->sz;
+
+			if (hashmap__delete(ps->rf_fwds, rf_fwd_key(fwd_task_id, e->seq_nr), NULL, &fwd_off)) {
+				if (ps->rf_link_cnt == ps->rf_link_cap) {
+					ps->rf_link_cap = ps->rf_link_cap ? ps->rf_link_cap * 2 : 1024;
+					ps->rf_link_offs = realloc(ps->rf_link_offs,
+								   ps->rf_link_cap * sizeof(*ps->rf_link_offs));
+				}
+				ps->rf_link_offs[ps->rf_link_cnt++] = fwd_off;
+				dst->flags |= WEF_PYTORCH_LINKED;
+			}
+		}
+
+		dst->sz = WEVENT_RF_SEQ_SZ;
+		dst->rf.fwd_task_id = fwd_task_id;
+		dst->rf.seq_nr = e->seq_nr;
+	}
 
 	return dst->sz;
 }

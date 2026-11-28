@@ -63,8 +63,7 @@ static int ksyms__add_symbol(struct ksyms *ksyms, const char *name, const char *
 	else
 		ksym->module = NULL;
 	ksym->addr = addr;
-	/* mark which symbols are functions for post-processing */
-	ksym->size = is_ksym_func(sym_type) ? (unsigned long)-1 : 0;
+	ksym->size = 0;
 	ksym->kind = is_ksym_func(sym_type) ? KSYM_FUNC : KSYM_DATA;
 
 	memcpy(ksyms->strs + ksyms->strs_sz, name, name_len);
@@ -99,16 +98,21 @@ static int ksym_by_name_cmp(const struct ksym *s1, const struct ksym *s2)
 	if (s1->kind != s2->kind)
 		return s1->kind < s2->kind ? -1 : 1;
 
+	ret = strcmp(s1->name, s2->name);
+	if (ret != 0)
+		return ret;
+
+	/* KSYM_ANY_MODULE appears in lookup keys. */
+	if (s1->module == KSYM_ANY_MODULE || s2->module == KSYM_ANY_MODULE)
+		return 0;
+
 	if (!!s1->module != !!s2->module)
 		return s2->module ? -1 : 1;
 
-	if (s1->module) {
-		ret = strcmp(s1->module, s2->module);
-		if (ret != 0)
-			return ret;
-	}
+	if (s1->module)
+		return strcmp(s1->module, s2->module);
 
-	return strcmp(s1->name, s2->name);
+	return 0;
 }
 
 static int ksym_by_name_order(const void *p1, const void *p2)
@@ -181,17 +185,18 @@ struct ksyms *ksyms__load(void)
 	ksyms->syms_by_name[ksyms->syms_sz] = NULL;
 
 	/* do another pass to calculate (guess?) function sizes */
-	for (i = 0; i < ksyms->syms_sz; i++) {
+	for (i = ksyms->syms_sz - 2; i >= 0; i--) {
 		struct ksym *ksym = &ksyms->syms_by_addr[i];
 		struct ksym *next_ksym = ksym + 1;
 
-		if (!ksym->size)
+		/* data sorts after functions, so this skips data and leaves the last function at size 0 */
+		if (next_ksym->kind != KSYM_FUNC)
 			continue;
 
-		if (i + 1 < ksyms->syms_sz && next_ksym->size)
-			ksym->size = next_ksym->addr - ksym->addr;
+		if (next_ksym->addr == ksym->addr)
+			ksym->size = next_ksym->size;
 		else
-			ksym->size = 0;
+			ksym->size = next_ksym->addr - ksym->addr;
 	}
 
 	return ksyms;

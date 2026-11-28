@@ -11,6 +11,7 @@
 #include "utils.h"
 #include "env.h"
 #include "utrace_cfg.h"
+#include "utrace.h"
 #include "strs.h"
 
 /* --- error reporting with position highlighting -------------------------- */
@@ -588,15 +589,24 @@ static struct utrace_param *ucfg_find_param(const struct utrace_cfg *cfg, enum u
 	return NULL;
 }
 
+bool ucfg_has_args(const struct utrace_cfg *cfg)
+{
+	return cfg->wildcard_args || ucfg_find_param(cfg, UTRACE_PARAM_ARG);
+}
+
 /* Does @cfg capture any argument on a u:, uret: or uspan: probe? */
 bool ucfg_has_uprobe_args(const struct utrace_cfg *cfg)
 {
-	if (cfg->type == UTRACE_SPAN)
+	switch (cfg->type) {
+	case UTRACE_SPAN:
 		return ucfg_has_uprobe_args(cfg->span.entry) || ucfg_has_uprobe_args(cfg->span.exit);
-	if (cfg->type != UTRACE_UPROBE && cfg->type != UTRACE_URETPROBE &&
-	    cfg->type != UTRACE_UPROBE_SPAN)
+	case UTRACE_UPROBE:
+	case UTRACE_URETPROBE:
+	case UTRACE_UPROBE_SPAN:
+		return ucfg_has_args(cfg);
+	default:
 		return false;
-	return cfg->wildcard_args || ucfg_find_param(cfg, UTRACE_PARAM_ARG);
+	}
 }
 
 static struct utrace_param *ucfg_add_param(struct utrace_cfg *cfg, enum utrace_param_type type)
@@ -1044,12 +1054,11 @@ static int parse_probe_def(struct sview orig, struct sview def, struct utrace_cf
 	case UTRACE_KPROBE:
 	case UTRACE_KRETPROBE:
 	case UTRACE_KPROBE_SPAN: {
-		struct sview name, offset;
+		struct sview name, offset, file, func;
 
+		/* Syntax: [module:]func[@file][+offset] */
 		name = sv_split(def, "+", &offset);
 		name = sv_trim(name);
-		cfg->uprobe.name = sv_strdup(name);
-
 		if (!sv_is_empty(offset)) {
 			if (cfg->type != UTRACE_KPROBE)
 				return utrace_err(orig, offset, "only kprobe supports offset\n");
@@ -1059,6 +1068,26 @@ static int parse_probe_def(struct sview orig, struct sview def, struct utrace_cf
 				return utrace_err(orig, offset, "invalid offset value\n");
 		}
 
+		name = sv_split(name, "@", &file);
+		name = sv_trim(name);
+		if (!sv_is_empty(file)) {
+			file = sv_trim(sv_consume_left(file, 1));
+			if (sv_is_empty(file))
+				return utrace_err(orig, def, "empty file name\n");
+			cfg->kprobe.file = sv_strdup(file);
+		}
+
+		name = sv_split(name, ":", &func);
+		name = sv_trim(name);
+		if (!sv_is_empty(func)) {
+			if (sv_is_empty(name))
+				return utrace_err(orig, def, "empty module name\n");
+			cfg->kprobe.module = sv_strdup(name);
+			name = sv_trim(sv_consume_left(func, 1));
+		}
+		if (sv_is_empty(name))
+			return utrace_err(orig, def, "empty function name\n");
+		cfg->kprobe.name = sv_strdup(name);
 		break;
 	}
 	case UTRACE_USDT: {
@@ -1235,16 +1264,64 @@ static int parse_cfg(struct sview def, struct utrace_cfg *cfg)
 
 int ucfg_parse(const char *def)
 {
-	env.utrace_cfgs = realloc(env.utrace_cfgs, (env.utrace_cfg_cnt + 1) * sizeof(*env.utrace_cfgs));
+	env.utrace->cfgs = realloc(env.utrace->cfgs, (env.utrace->cfg_cnt + 1) * sizeof(*env.utrace->cfgs));
 
-	struct utrace_cfg *cfg = &env.utrace_cfgs[env.utrace_cfg_cnt];
+	struct utrace_cfg *cfg = &env.utrace->cfgs[env.utrace->cfg_cnt];
 	int err = parse_cfg(sv_new(def), cfg);
 
 	if (err)
 		return err;
 	if (cfg->settings.scope == UTRACE_SCOPE_UNSET)
 		cfg->settings.scope = UTRACE_SCOPE_THREAD;
-	env.utrace_cfg_cnt++;
+	env.utrace->cfg_cnt++;
+	return 0;
+}
+
+/*
+ * Parse the probe of a --prepare/--activate utrace trigger into cfg. A trigger
+ * only needs to know where to attach, so of the utrace definition it takes
+ * just the probe target and the parameters selecting what it attaches to.
+ */
+int ucfg_parse_trigger(const char *def, struct utrace_cfg *cfg)
+{
+	struct sview orig = sv_new(def);
+	int err;
+
+	err = parse_cfg(orig, cfg);
+	if (err)
+		return err;
+
+	/* covers ~~ spans (UTRACE_SPAN) and uspan:/kspan:/bpfspan: alike */
+	if (is_span_probe(cfg->type))
+		return utrace_err(orig, orig, "triggers can't be spans\n");
+	/* parse_cfg() zeroes cfg, and only given |...| settings fill it in */
+	if (memcmp(&cfg->settings, &(struct utrace_settings){}, sizeof(cfg->settings)) != 0)
+		return utrace_err(orig, orig, "triggers don't take settings\n");
+	if (cfg->wildcard_args)
+		return utrace_err(orig, orig, "triggers don't capture arguments\n");
+
+	for (int i = 0; i < cfg->param_cnt; i++) {
+		switch (cfg->params[i].type) {
+		case UTRACE_PARAM_BINARY_PATH:
+		case UTRACE_PARAM_NV_SMI:
+		case UTRACE_PARAM_COMM:
+			/* parse_cfg() already limited these to uprobe-based probes */
+			break;
+		case UTRACE_PARAM_PID:
+			/* utrace ignores pid: of kernel probes, for a trigger it would fire on any process */
+			if (!is_uprobe(cfg->type))
+				return utrace_err(orig, orig, "'pid' parameter of triggers is only valid for uprobe-based probes\n");
+			break;
+		case UTRACE_PARAM_ARG:
+			return utrace_err(orig, orig, "triggers don't capture arguments\n");
+		case UTRACE_PARAM_CAPTURE_STACK:
+			return utrace_err(orig, orig, "triggers don't capture stack traces\n");
+		default:
+			return utrace_err(orig, orig, "unsupported trigger parameter\n");
+		}
+	}
+
+	cfg->settings.scope = UTRACE_SCOPE_THREAD;
 	return 0;
 }
 
@@ -1328,7 +1405,11 @@ static void format_probe(const struct utrace_cfg *cfg, struct sbuf *sb)
 	case UTRACE_KPROBE:
 	case UTRACE_KRETPROBE:
 	case UTRACE_KPROBE_SPAN:
+		if (cfg->kprobe.module)
+			sbuf_appendf(sb, "%s:", cfg->kprobe.module);
 		sbuf_appendf(sb, "%s", cfg->kprobe.name);
+		if (cfg->kprobe.file)
+			sbuf_appendf(sb, "@%s", cfg->kprobe.file);
 		if (cfg->kprobe.off)
 			sbuf_appendf(sb, "+0x%lx", cfg->kprobe.off);
 		break;

@@ -17,8 +17,10 @@
 #include "utrace.h"
 #include "utrace_cfg.h"
 #include "elf_utils.h"
+#include "ksyms.h"
 #include "bpf_utils.h"
 #include "proc.h"
+#include "wrust.h"
 #include "wprof_query.h"
 #include "wprof.skel.h"
 
@@ -33,13 +35,16 @@ static enum utrace_arg_type usdt_arg_to_utrace_type(const struct usdt_arg_info *
 	}
 }
 
+/* Takes ownership of link on both success and failure. */
 static int add_link(struct bpf_state *st, struct bpf_link *link)
 {
 	struct bpf_link **tmp;
 
 	tmp = realloc(st->links, (st->link_cnt + 1) * sizeof(struct bpf_link *));
-	if (!tmp)
+	if (!tmp) {
+		bpf_link__destroy(link);
 		return -ENOMEM;
+	}
 	st->links = tmp;
 	st->links[st->link_cnt] = link;
 	st->link_cnt++;
@@ -1738,8 +1743,8 @@ static int utrace_augment_args(void)
 {
 	bool need_btf = false;
 
-	for (int i = 0; i < env.utrace_cfg_cnt; i++) {
-		if (cfg_needs_btf(&env.utrace_cfgs[i])) {
+	for (int i = 0; i < env.utrace->cfg_cnt; i++) {
+		if (cfg_needs_btf(&env.utrace->cfgs[i])) {
 			need_btf = true;
 			break;
 		}
@@ -1747,15 +1752,15 @@ static int utrace_augment_args(void)
 
 	struct btf *vmlinux_btf = need_btf ? load_vmlinux_btf() : NULL;
 
-	for (int i = 0; i < env.utrace_cfg_cnt; i++) {
-		int err = augment_cfg_args(&env.utrace_cfgs[i], vmlinux_btf);
+	for (int i = 0; i < env.utrace->cfg_cnt; i++) {
+		int err = augment_cfg_args(&env.utrace->cfgs[i], vmlinux_btf);
 		if (err)
 			return err;
 	}
 
 	/* compile name/id templates after all arg types/names are resolved */
-	for (int i = 0; i < env.utrace_cfg_cnt; i++) {
-		int err = ucfg_compile_tmpls(&env.utrace_cfgs[i]);
+	for (int i = 0; i < env.utrace->cfg_cnt; i++) {
+		int err = ucfg_compile_tmpls(&env.utrace->cfgs[i]);
 		if (err)
 			return err;
 	}
@@ -1792,7 +1797,7 @@ static int resolve_uprobe_binary(int pid, const char *sym_name,
 			 pid, (unsigned long long)vma->vma_start, (unsigned long long)vma->vma_end);
 
 		unsigned long offset = 0;
-		if (elf_find_syms(map_file, STT_FUNC, &sym_name, 1, &offset))
+		if (elf_find_syms(map_file, STT_FUNC, &sym_name, 1, &offset, NULL))
 			continue;
 
 		*attach_path_out = strdup(map_file);
@@ -1823,7 +1828,7 @@ static int resolve_uprobe_cfg(struct utrace_cfg *cfg, bool mandatory)
 
 	if (binary_path) {
 		const char *sym_name = cfg->uprobe.name;
-		int err = elf_find_syms(binary_path, STT_FUNC, &sym_name, 1, &sym_offset);
+		int err = elf_find_syms(binary_path, STT_FUNC, &sym_name, 1, &sym_offset, NULL);
 		if (err < 0) {
 			log_printf(lvl, "utrace: failed to resolve symbol '%s' in '%s': %d\n",
 				   cfg->uprobe.name, binary_path, err);
@@ -2277,14 +2282,14 @@ static void utrace_pid_iter_destroy(struct utrace_pid_iter *it)
 /*
  * Expand probes carrying discovered specifiers into concrete per-PID cfgs, the
  * candidates being the intersection of everything specified. Resolution happens
- * later in the normal utrace_setup loop, but a probe matching no process at all
+ * later in the normal utrace_resolve() loop, but a probe matching no process at all
  * is an error here: it would otherwise vanish silently and record nothing.
  */
-static int utrace_discover_pids(void)
+static int utrace_discover_pids(struct utrace_session *sess)
 {
 	bool has_discovery = false;
-	for (int i = 0; i < env.utrace_cfg_cnt; i++) {
-		if (cfg_pid_specs(&env.utrace_cfgs[i]) & UTRACE_PID_SPEC_DISCOVERED) {
+	for (int i = 0; i < sess->cfg_cnt; i++) {
+		if (cfg_pid_specs(&sess->cfgs[i]) & UTRACE_PID_SPEC_DISCOVERED) {
 			has_discovery = true;
 			break;
 		}
@@ -2295,8 +2300,8 @@ static int utrace_discover_pids(void)
 	struct utrace_cfg *new_cfgs = NULL;
 	int new_cnt = 0;
 
-	for (int i = 0; i < env.utrace_cfg_cnt; i++) {
-		struct utrace_cfg *src = &env.utrace_cfgs[i];
+	for (int i = 0; i < sess->cfg_cnt; i++) {
+		struct utrace_cfg *src = &sess->cfgs[i];
 		enum utrace_pid_spec specs = cfg_pid_specs(src);
 
 		new_cfgs = realloc(new_cfgs, (new_cnt + 1) * sizeof(*new_cfgs));
@@ -2343,51 +2348,33 @@ static int utrace_discover_pids(void)
 		}
 	}
 
-	free(env.utrace_cfgs);
-	env.utrace_cfgs = new_cfgs;
-	env.utrace_cfg_cnt = new_cnt;
+	free(sess->cfgs);
+	sess->cfgs = new_cfgs;
+	sess->cfg_cnt = new_cnt;
 
 	return 0;
 }
 
-int utrace_setup(struct wprof_bpf *skel)
+/*
+ * Resolve attach targets of the session's probes, expanding PID discovery in
+ * place, and enable the session's programs that they will attach through.
+ */
+int utrace_resolve(struct utrace_session *sess)
 {
-	int err = utrace_discover_pids();
+	const struct utrace_progs *progs = &sess->progs;
+	int err = utrace_discover_pids(sess);
 	if (err) {
 		eprintf("Failed to expand utrace PID discovery: %d\n", err);
 		return err;
 	}
 
-	if (env.utrace_cfg_cnt == 0) {
-		env.capture_utrace = FALSE;
-		env.requested_stack_traces &= ~ST_UTRACE;
-		bpf_map__set_autocreate(skel->maps.utrace_probe_cfgs, false);
-		bpf_map__set_autocreate(skel->maps.utrace_scratch, false);
-		return 0;
-	}
-
-	env.capture_utrace = TRUE;
-
-	if (!(env.requested_stack_traces & ST_UTRACE)) {
-		for (int i = 0; i < env.utrace_cfg_cnt; i++) {
-			const struct utrace_cfg *cfg = &env.utrace_cfgs[i];
-			for (int j = 0; j < cfg->param_cnt; j++) {
-				if (cfg->params[j].type == UTRACE_PARAM_CAPTURE_STACK) {
-					eprintf("utrace config #%d requests 'stack' capture, but -Sutrace is not enabled\n", i + 1);
-					return -EINVAL;
-				}
-			}
-		}
-	}
-
 	bool need_fentry = false, need_fexit = false;
 	int first_prog_fd = -1;
 	const char *first_func_name = NULL;
-	int map_cnt = 0;
 	bool had_discovery = false;
 
-	for (int i = 0; i < env.utrace_cfg_cnt; i++) {
-		struct utrace_cfg *cfg = &env.utrace_cfgs[i];
+	for (int i = 0; i < sess->cfg_cnt; i++) {
+		struct utrace_cfg *cfg = &sess->cfgs[i];
 		int err = 0;
 
 		/* a probe expanded by PID discovery isn't attached itself, only its clones are */
@@ -2404,9 +2391,9 @@ int utrace_setup(struct wprof_bpf *skel)
 			case UTRACE_URETPROBE:
 			case UTRACE_UPROBE_SPAN:
 				if (cfg_needs_uprobe(leg))
-					bpf_program__set_autoload(skel->progs.wprof_ut_uprobe, true);
+					bpf_program__set_autoload(progs->ut_uprobe, true);
 				if (cfg_needs_uretprobe(leg))
-					bpf_program__set_autoload(skel->progs.wprof_ut_uret, true);
+					bpf_program__set_autoload(progs->ut_uret, true);
 				err = resolve_uprobe_cfg(leg, mandatory);
 				break;
 			case UTRACE_KPROBE:
@@ -2415,25 +2402,25 @@ int utrace_setup(struct wprof_bpf *skel)
 				struct btf *vmlinux_btf = load_vmlinux_btf();
 				bool has_multi = btf__find_by_name_kind(vmlinux_btf, "bpf_kprobe_multi_link", BTF_KIND_STRUCT) > 0;
 				if (cfg_needs_kprobe(leg)) {
-					bpf_program__set_autoload(skel->progs.wprof_ut_kprobe, true);
-					bpf_program__set_autoload(skel->progs.wprof_ut_kmulti, has_multi);
+					bpf_program__set_autoload(progs->ut_kprobe, true);
+					bpf_program__set_autoload(progs->ut_kmulti, has_multi);
 				}
 				if (cfg_needs_kretprobe(leg)) {
-					bpf_program__set_autoload(skel->progs.wprof_ut_kret, true);
-					bpf_program__set_autoload(skel->progs.wprof_ut_kretmulti, has_multi);
+					bpf_program__set_autoload(progs->ut_kret, true);
+					bpf_program__set_autoload(progs->ut_kretmulti, has_multi);
 				}
 				break;
 			}
 			case UTRACE_USDT:
-				bpf_program__set_autoload(skel->progs.wprof_ut_usdt, true);
-				bpf_program__set_autoattach(skel->progs.wprof_ut_usdt, false);
+				bpf_program__set_autoload(progs->ut_usdt, true);
+				bpf_program__set_autoattach(progs->ut_usdt, false);
 				err = resolve_usdt_cfg(leg, mandatory);
 				break;
 			case UTRACE_RAW_TRACEPOINT:
-				bpf_program__set_autoload(skel->progs.wprof_ut_raw_tp, true);
+				bpf_program__set_autoload(progs->ut_raw_tp, true);
 				break;
 			case UTRACE_TRACEPOINT:
-				bpf_program__set_autoload(skel->progs.wprof_ut_tp, true);
+				bpf_program__set_autoload(progs->ut_tp, true);
 				break;
 			case UTRACE_BPF_PROBE:
 			case UTRACE_BPF_RETPROBE:
@@ -2514,8 +2501,7 @@ int utrace_setup(struct wprof_bpf *skel)
 
 		cfg->stats.resolve_cnt = 1;
 		if (cfg->parent_idx >= 0)
-			env.utrace_cfgs[cfg->parent_idx].stats.resolve_cnt += 1;
-		map_cnt += cfg_is_span(cfg) ? 2 : 1;
+			sess->cfgs[cfg->parent_idx].stats.resolve_cnt += 1;
 	}
 
 	/*
@@ -2526,8 +2512,8 @@ int utrace_setup(struct wprof_bpf *skel)
 	if (had_discovery) {
 		int j = 0;
 
-		for (int i = 0; i < env.utrace_cfg_cnt; i++) {
-			struct utrace_cfg *cfg = &env.utrace_cfgs[i];
+		for (int i = 0; i < sess->cfg_cnt; i++) {
+			struct utrace_cfg *cfg = &sess->cfgs[i];
 
 			if (cfg->stats.clone_cnt == 0)
 				continue;
@@ -2544,17 +2530,14 @@ int utrace_setup(struct wprof_bpf *skel)
 			}
 		}
 
-		for (int i = 0; i < env.utrace_cfg_cnt; i++) {
-			if (env.utrace_cfgs[i].stats.clone_cnt > 0 || env.utrace_cfgs[i].stats.resolve_cnt == 0)
+		for (int i = 0; i < sess->cfg_cnt; i++) {
+			if (sess->cfgs[i].stats.clone_cnt > 0 || sess->cfgs[i].stats.resolve_cnt == 0)
 				continue;
-			env.utrace_cfgs[j] = env.utrace_cfgs[i];
+			sess->cfgs[j] = sess->cfgs[i];
 			j += 1;
 		}
-		env.utrace_cfg_cnt = j;
+		sess->cfg_cnt = j;
 	}
-
-	bpf_map__set_autocreate(skel->maps.utrace_probe_cfgs, true);
-	bpf_map__set_max_entries(skel->maps.utrace_probe_cfgs, map_cnt);
 
 	if (first_prog_fd >= 0) {
 		/*
@@ -2565,40 +2548,390 @@ int utrace_setup(struct wprof_bpf *skel)
 		 * (templates are only used as clone sources).
 		 */
 		if (need_fentry) {
-			err = bpf_program__set_attach_target(skel->progs.wprof_ut_bpf_entry,
+			err = bpf_program__set_attach_target(progs->ut_bpf_entry,
 							     first_prog_fd, first_func_name);
 			if (err) {
 				eprintf("utrace: failed to set fentry attach target: %d\n", err);
 				return err;
 			}
-			bpf_program__set_autoload(skel->progs.wprof_ut_bpf_entry, true);
+			bpf_program__set_autoload(progs->ut_bpf_entry, true);
 		}
 		if (need_fexit) {
-			err = bpf_program__set_attach_target(skel->progs.wprof_ut_bpf_exit,
+			err = bpf_program__set_attach_target(progs->ut_bpf_exit,
 							     first_prog_fd, first_func_name);
 			if (err) {
 				eprintf("utrace: failed to set fexit attach target: %d\n", err);
 				return err;
 			}
-			bpf_program__set_autoload(skel->progs.wprof_ut_bpf_exit, true);
+			bpf_program__set_autoload(progs->ut_bpf_exit, true);
 		}
 	}
 
-	err = utrace_augment_args();
-	if (err)
-		return err;
+	return 0;
+}
 
-	/* Free BPF program BTFs — only needed for arg resolution above */
-	for (int i = 0; i < env.utrace_cfg_cnt; i++) {
-		utrace_for_each_leg(leg, &env.utrace_cfgs[i]) {
+/* Free BPF program BTFs, needed only by utrace_resolve() and arg resolution after it */
+void utrace_release_btfs(struct utrace_session *sess)
+{
+	for (int i = 0; i < sess->cfg_cnt; i++) {
+		utrace_for_each_leg(leg, &sess->cfgs[i]) {
 			if (cfg_is_bpf_type(leg)) {
 				btf__free(leg->bpf_prog.btf);
 				leg->bpf_prog.btf = NULL;
 			}
 		}
 	}
+}
+
+static struct utrace_progs skel_utrace_progs(struct wprof_bpf *skel)
+{
+	return (struct utrace_progs){
+		.ut_uprobe = skel->progs.wprof_ut_uprobe,
+		.ut_uret = skel->progs.wprof_ut_uret,
+		.ut_usdt = skel->progs.wprof_ut_usdt,
+		.ut_kprobe = skel->progs.wprof_ut_kprobe,
+		.ut_kmulti = skel->progs.wprof_ut_kmulti,
+		.ut_kret = skel->progs.wprof_ut_kret,
+		.ut_kretmulti = skel->progs.wprof_ut_kretmulti,
+		.ut_tp = skel->progs.wprof_ut_tp,
+		.ut_raw_tp = skel->progs.wprof_ut_raw_tp,
+		.ut_bpf_entry = skel->progs.wprof_ut_bpf_entry,
+		.ut_bpf_exit = skel->progs.wprof_ut_bpf_exit,
+	};
+}
+
+int utrace_setup(struct wprof_bpf *skel)
+{
+	int err, map_cnt = 0;
+
+	env.utrace->progs = skel_utrace_progs(skel);
+
+	if (env.utrace->cfg_cnt == 0) {
+		env.capture_utrace = FALSE;
+		env.requested_stack_traces &= ~ST_UTRACE;
+		bpf_map__set_autocreate(skel->maps.utrace_probe_cfgs, false);
+		bpf_map__set_autocreate(skel->maps.utrace_scratch, false);
+		return 0;
+	}
+
+	env.capture_utrace = TRUE;
+
+	if (!(env.requested_stack_traces & ST_UTRACE)) {
+		for (int i = 0; i < env.utrace->cfg_cnt; i++) {
+			const struct utrace_cfg *cfg = &env.utrace->cfgs[i];
+			for (int j = 0; j < cfg->param_cnt; j++) {
+				if (cfg->params[j].type == UTRACE_PARAM_CAPTURE_STACK) {
+					eprintf("utrace config #%d requests 'stack' capture, but -Sutrace is not enabled\n", i + 1);
+					return -EINVAL;
+				}
+			}
+		}
+	}
+
+	err = utrace_resolve(env.utrace);
+	if (err)
+		return err;
+
+	for (int i = 0; i < env.utrace->cfg_cnt; i++)
+		map_cnt += cfg_is_span(&env.utrace->cfgs[i]) ? 2 : 1;
+	bpf_map__set_autocreate(skel->maps.utrace_probe_cfgs, true);
+	bpf_map__set_max_entries(skel->maps.utrace_probe_cfgs, map_cnt);
+
+	err = utrace_augment_args();
+	if (err)
+		return err;
+
+	utrace_release_btfs(env.utrace);
+	return 0;
+}
+
+struct dwarf_infos {
+	/* Used to limit amount of information collected from DWARF */
+	const char **kprobe_func_names;
+	size_t kprobe_func_name_cnt;
+	struct dwarf_info *vmlinux;
+	unsigned long vmlinux_kaslr_offset; /* -1 if unavailable. */
+	bool vmlinux_attempted;
+};
+
+static void dwarf_infos_free(struct dwarf_infos *dwarfs)
+{
+	dwarf_info_free(dwarfs->vmlinux);
+	free(dwarfs->kprobe_func_names);
+}
+
+/*
+ * Derive the KASLR offset from _stext, shamelessly copied from blazesym's
+ * find_stext_kaslr_offset() in src/kernel/kaslr.rs.
+ *
+ * _stext is a linker-defined symbol marking the start of kernel text.
+ * kallsyms lists it as a global text symbol, giving its runtime address:
+ *
+ *     ffffffff81000000 T _stext
+ *
+ * The corresponding line from readelf -Ws vmlinux gives its linked address:
+ *
+ *     209802: ffffffff81000000     0 NOTYPE  GLOBAL DEFAULT    1 _stext
+ *
+ * The difference gives the KASLR offset.
+ * Returns -1 if either address is unavailable.
+ */
+static unsigned long find_vmlinux_kaslr_offset(const char *path)
+{
+	const char *sym = "_stext";
+	unsigned long elf_stext;
+	int err;
+
+	err = elf_find_syms(path, STT_NOTYPE, &sym, 1, NULL, &elf_stext);
+	if (err) {
+		eprintf("utrace: failed to find _stext in '%s': %s\n", path, errstr(err));
+		return -1;
+	}
+
+	struct ksyms *ksyms = load_ksyms();
+	if (!ksyms) {
+		eprintf("utrace: failed to load kallsyms\n");
+		return -1;
+	}
+	const struct ksym *ksym = ksyms__get_symbol(ksyms, "_stext", NULL, KSYM_FUNC);
+	if (!ksym || !ksym->addr) {
+		eprintf("utrace: failed to find a nonzero _stext address in kallsyms\n");
+		return -1;
+	}
+	return ksym->addr - elf_stext;
+}
+
+static bool load_vmlinux_dwarf(struct dwarf_infos *dwarfs)
+{
+	if (!dwarfs->vmlinux_attempted) {
+		struct dwarf_info *vmlinux;
+
+		dwarfs->vmlinux_attempted = true;
+		dwarfs->vmlinux_kaslr_offset = -1;
+		vmlinux = dwarf_info_init_vmlinux(dwarfs->kprobe_func_names, dwarfs->kprobe_func_name_cnt);
+		if (!vmlinux)
+			return false;
+
+		dwarfs->vmlinux_kaslr_offset = find_vmlinux_kaslr_offset(dwarf_info_elf_path(vmlinux));
+		if (dwarfs->vmlinux_kaslr_offset == (unsigned long)-1) {
+			dwarf_info_free(vmlinux);
+			return false;
+		}
+		dwarfs->vmlinux = vmlinux;
+	}
+	return dwarfs->vmlinux != NULL;
+}
+
+static bool path_has_suffix(const char *path, const char *suffix)
+{
+	if (!str_has_suffix(path, suffix))
+		return false;
+
+	size_t off = strlen(path) - strlen(suffix);
+	return off == 0 || path[off - 1] == '/';
+}
+
+/*
+ * Handles kprobe `[module:]func_name...` special case for `vmlinux:` selector:
+ * - cfg->kprobe.module == "vmlinux" -> search in the kernel only.
+ * - cfg->kprobe.module == "foo"     -> search in the module "foo".
+ * - cfg->kprobe.module == NULL      -> search in the kernel and in all the modules.
+ * NULL @module denotes the main kernel.
+ */
+static bool match_module_name(const struct utrace_cfg *cfg, const char *module)
+{
+	const char *selector = cfg->kprobe.module;
+
+	if (selector == NULL)
+		return true;
+	if (strcmp(selector, "vmlinux") == 0)
+		return module == NULL;
+	return module && strcmp(selector, module) == 0;
+}
+
+static int find_funcs_in_dwarf(struct dwarf_infos *dwarfs, const struct utrace_cfg *cfg,
+			       unsigned long **addrs, size_t *cnt)
+{
+	const struct dwarf_func_info *func_infos;
+	size_t func_cnt, skipped_inline = 0;
+	const char *file = cfg->kprobe.file;
+	const char *file_name;
+	unsigned long addr;
+	int err;
+
+	*addrs = NULL;
+	*cnt = 0;
+	/* Only vmlinux DWARF is indexed so far. */
+	if (!match_module_name(cfg, NULL))
+		return 0;
+
+	if (!load_vmlinux_dwarf(dwarfs))
+		return 0;
+
+	func_infos = dwarf_info_find_func(dwarfs->vmlinux, cfg->kprobe.name, &func_cnt);
+	if (!func_infos)
+		return 0;
+
+	for (size_t i = 0; i < func_cnt; i++) {
+		file_name = func_infos[i].file_name;
+		if (file && (!file_name || !path_has_suffix(file_name, file)))
+			continue;
+
+		/*
+		 * Inline instances need not be contiguous, so offsets aren't meaningful.
+		 * They also have no standalone return site for kretprobes or native spans,
+		 * and no calling convention to read arguments from.
+		 */
+		if (func_infos[i].is_inline &&
+		    (cfg->kprobe.off != 0 || cfg->type != UTRACE_KPROBE || ucfg_has_args(cfg))) {
+			skipped_inline++;
+			continue;
+		}
+
+		addr = func_infos[i].addr + dwarfs->vmlinux_kaslr_offset;
+		err = append_long(addrs, cnt, addr);
+		if (err)
+			return err;
+	}
+	if (skipped_inline != 0) {
+		struct sbuf sb = sbuf_new();
+
+		ucfg_format(cfg, &sb);
+		wprintf("utrace: skipped %zu attachments to inlined functions for probe '%s'\n",
+			skipped_inline, sbuf_str(&sb));
+		sbuf_free(&sb);
+	}
+	return 0;
+}
+
+static int append_missing_kallsyms_funcs(const struct utrace_cfg *cfg,
+					 unsigned long **addrs, size_t *cnt)
+{
+	const char *module, *name = cfg->kprobe.name;
+	struct ksyms *ksyms = load_ksyms();
+	const struct ksym * const *it;
+	int err;
+
+	if (!ksyms) {
+		eprintf("utrace: failed to load kallsyms\n");
+		return 0;
+	}
+	if (cfg->kprobe.module == NULL)
+		module = KSYM_ANY_MODULE;
+	else if (match_module_name(cfg, NULL))
+		module = NULL;
+	else
+		module = cfg->kprobe.module;
+	it = ksyms__get_symbol_iter(ksyms, name, module, KSYM_FUNC);
+	for (; it && *it; it++) {
+		const struct ksym *sym = *it;
+		size_t i;
+
+		if (sym->kind != KSYM_FUNC || strcmp(sym->name, cfg->kprobe.name) != 0)
+			break;
+		if (!match_module_name(cfg, sym->module))
+			break;
+		if (!sym->addr)
+			continue;
+		for (i = 0; i < *cnt; i++) {
+			if ((*addrs)[i] == sym->addr)
+				break;
+		}
+		if (i < *cnt)
+			continue;
+		err = append_long(addrs, cnt, sym->addr);
+		if (err)
+			return err;
+	}
+	return 0;
+}
+
+static int resolve_kprobe_addrs(struct dwarf_infos *dwarfs, const struct utrace_cfg *cfg,
+				unsigned long **addrs, size_t *cnt)
+{
+	int err;
+
+	err = find_funcs_in_dwarf(dwarfs, cfg, addrs, cnt);
+	if (err)
+		goto err_out;
+
+	/* kallsyms have no source paths, only look there if there is no file selector. */
+	if (!cfg->kprobe.file) {
+		err = append_missing_kallsyms_funcs(cfg, addrs, cnt);
+		if (err)
+			goto err_out;
+	}
+
+	if (*cnt == 0) {
+		err = -ESRCH;
+		goto err_out;
+	}
 
 	return 0;
+
+err_out:
+	struct sbuf sb = sbuf_new();
+
+	ucfg_format(cfg, &sb);
+	eprintf("utrace: failed to resolve kernel probe '%s': %s\n", sbuf_str(&sb), errstr(err));
+	sbuf_free(&sb);
+	return err;
+}
+
+static bool is_kfunc_entry(unsigned long addr)
+{
+	const struct ksym *sym = ksyms__map_addr(load_ksyms(), addr, KSYM_FUNC);
+
+	return sym && sym->addr == addr;
+}
+
+static int attach_kprobe_addr(struct bpf_state *st, const struct utrace_progs *progs,
+			      const struct utrace_cfg *cfg, unsigned long addr, bool has_multi,
+			      bool is_retprobe, __u64 cookie)
+{
+	const char *kind = is_retprobe ? "kretprobe" : "kprobe";
+	unsigned long target = addr + cfg->kprobe.off;
+	struct bpf_link *link = NULL;
+	int err;
+
+	/*
+	 * Multi-kprobe is generally faster than legacy breakpoint-based kprobes, but can
+	 * only attach at function entry. Use it when the offset is zero (always true for
+	 * kretprobe and span legs) and the address isn't an inlined copy inside another
+	 * function, and fall back to the legacy program for non-zero offsets, inlined
+	 * copies, or functions that aren't ftrace-attachable.
+	 */
+	if (has_multi && cfg->kprobe.off == 0 && is_kfunc_entry(addr)) {
+		struct bpf_program *prog = is_retprobe ? progs->ut_kretmulti : progs->ut_kmulti;
+		LIBBPF_OPTS(bpf_kprobe_multi_opts, mopts,
+			.addrs = &target,
+			.cookies = &cookie,
+			.cnt = 1,
+			.retprobe = is_retprobe,
+		);
+		link = bpf_program__attach_kprobe_multi_opts(prog, NULL, &mopts);
+		if (!link) {
+			err = -errno;
+			vprintf("utrace: multi-%s attach to '%s' at 0x%lx failed: %s. Falling back to legacy %s.\n",
+				kind, cfg->kprobe.name, target, errstr(err), kind);
+		}
+	}
+	if (!link) {
+		struct bpf_program *prog = is_retprobe ? progs->ut_kret : progs->ut_kprobe;
+		LIBBPF_OPTS(bpf_kprobe_opts, opts,
+			.bpf_cookie = cookie,
+			.retprobe = is_retprobe,
+			.offset = target,
+		);
+		link = bpf_program__attach_kprobe_opts(prog, NULL, &opts);
+	}
+	if (!link) {
+		err = -errno;
+		eprintf("utrace: failed to attach %s to '%s' at 0x%lx: %s\n",
+			kind, cfg->kprobe.name, target, errstr(err));
+		return err;
+	}
+	return add_link(st, link);
 }
 
 /*
@@ -2606,26 +2939,29 @@ int utrace_setup(struct wprof_bpf *skel)
  * native span). Callers of native spans (UPROBE_SPAN/KPROBE_SPAN/BPF_SPAN) invoke
  * this twice with is_retprobe false/true for entry/exit sides. For simple ret
  * types (URETPROBE/KRETPROBE/BPF_RETPROBE) callers pass is_retprobe=true.
+ * Kernel probes attach to target addresses resolved by resolve_kprobe_addrs().
  */
-static int attach_utrace_probe(struct bpf_state *st, struct wprof_bpf *skel,
+static int attach_utrace_probe(struct bpf_state *st, const struct utrace_progs *progs,
 			       struct utrace_cfg *cfg, int utrace_id,
 			       enum utrace_event_type event_type, bool is_exit,
-			       bool is_retprobe, int map_fd, u32 *map_idx)
+			       bool is_retprobe, int map_fd, u32 *map_idx,
+			       const unsigned long *addrs, size_t addr_cnt)
 {
 	struct utrace_probe_cfg pcfg;
 	int err;
 
-	fill_probe_cfg(&pcfg, cfg, utrace_id, event_type, is_exit);
-	err = bpf_map_update_elem(map_fd, map_idx, &pcfg, BPF_ANY);
-	if (err)
-		return err;
+	if (map_fd >= 0) {
+		fill_probe_cfg(&pcfg, cfg, utrace_id, event_type, is_exit);
+		err = bpf_map_update_elem(map_fd, map_idx, &pcfg, BPF_ANY);
+		if (err)
+			return err;
+	}
 
 	switch (cfg->type) {
 	case UTRACE_UPROBE:
 	case UTRACE_URETPROBE:
 	case UTRACE_UPROBE_SPAN: {
-		struct bpf_program *prog = is_retprobe ? skel->progs.wprof_ut_uret
-						       : skel->progs.wprof_ut_uprobe;
+		struct bpf_program *prog = is_retprobe ? progs->ut_uret : progs->ut_uprobe;
 		LIBBPF_OPTS(bpf_uprobe_opts, opts, .bpf_cookie = *map_idx, .retprobe = is_retprobe);
 		struct bpf_link *link = bpf_program__attach_uprobe_opts(prog, cfg_pid(cfg),
 									cfg->uprobe.attach_path,
@@ -2645,60 +2981,20 @@ static int attach_utrace_probe(struct bpf_state *st, struct wprof_bpf *skel,
 	case UTRACE_KPROBE:
 	case UTRACE_KRETPROBE:
 	case UTRACE_KPROBE_SPAN: {
-		const char *kind = is_retprobe ? "kretprobe" : "kprobe";
-		struct bpf_link *link = NULL;
 		struct btf *vmlinux_btf = load_vmlinux_btf();
 		bool has_multi = btf__find_by_name_kind(vmlinux_btf, "bpf_kprobe_multi_link", BTF_KIND_STRUCT) > 0;
 
-		/*
-		 * Multi-kprobe is generally faster than legacy breakpoint-based kprobes, but can
-		 * only attach at function entry. Use it when the offset is zero (always true for
-		 * kretprobe and span legs), and fall back to the legacy program for non-zero
-		 * offsets or functions that aren't ftrace-attachable.
-		 */
-		if (has_multi && cfg->kprobe.off == 0) {
-			struct bpf_program *prog = is_retprobe ? skel->progs.wprof_ut_kretmulti : skel->progs.wprof_ut_kmulti;
-			const char *sym = cfg->kprobe.name;
-			__u64 cookie = *map_idx;
-			LIBBPF_OPTS(bpf_kprobe_multi_opts, mopts,
-				.syms = &sym,
-				.cookies = &cookie,
-				.cnt = 1,
-				.retprobe = is_retprobe,
-			);
-			link = bpf_program__attach_kprobe_multi_opts(prog, NULL, &mopts);
-			if (!link) {
-				err = -errno;
-				vprintf("utrace: multi-%s attach to '%s' failed: %s. Falling back to legacy %s.\n",
-					kind, cfg->kprobe.name, errstr(err), kind);
-			}
+		for (size_t i = 0; i < addr_cnt; i++) {
+			err = attach_kprobe_addr(st, progs, cfg, addrs[i], has_multi, is_retprobe, *map_idx);
+			if (err)
+				return err;
 		}
-
-		if (!link) {
-			struct bpf_program *prog = is_retprobe ? skel->progs.wprof_ut_kret : skel->progs.wprof_ut_kprobe;
-			LIBBPF_OPTS(bpf_kprobe_opts, opts,
-				.bpf_cookie = *map_idx,
-				.retprobe = is_retprobe,
-				.offset = cfg->kprobe.off,
-			);
-			link = bpf_program__attach_kprobe_opts(prog, cfg->kprobe.name, &opts);
-		}
-
-		if (!link) {
-			err = -errno;
-			eprintf("utrace: failed to attach %s to '%s': %s\n", kind, cfg->kprobe.name, errstr(err));
-			return err;
-		}
-		err = add_link(st, link);
-		if (err)
-			return err;
 		break;
 	}
 	case UTRACE_BPF_PROBE:
 	case UTRACE_BPF_RETPROBE:
 	case UTRACE_BPF_SPAN: {
-		struct bpf_program *tmpl = is_retprobe ? skel->progs.wprof_ut_bpf_exit
-						       : skel->progs.wprof_ut_bpf_entry;
+		struct bpf_program *tmpl = is_retprobe ? progs->ut_bpf_exit : progs->ut_bpf_entry;
 		enum bpf_attach_type atype = is_retprobe ? BPF_TRACE_FEXIT : BPF_TRACE_FENTRY;
 
 		LIBBPF_OPTS(bpf_prog_load_opts, clone_opts,
@@ -2727,7 +3023,7 @@ static int attach_utrace_probe(struct bpf_state *st, struct wprof_bpf *skel,
 	}
 	case UTRACE_TRACEPOINT: {
 		LIBBPF_OPTS(bpf_tracepoint_opts, opts, .bpf_cookie = *map_idx);
-		struct bpf_link *link = bpf_program__attach_tracepoint_opts(skel->progs.wprof_ut_tp,
+		struct bpf_link *link = bpf_program__attach_tracepoint_opts(progs->ut_tp,
 									    cfg->tp.cat, cfg->tp.name, &opts);
 		if (!link) {
 			err = -errno;
@@ -2742,7 +3038,7 @@ static int attach_utrace_probe(struct bpf_state *st, struct wprof_bpf *skel,
 	case UTRACE_RAW_TRACEPOINT: {
 		LIBBPF_OPTS(bpf_raw_tracepoint_opts, opts, .cookie = *map_idx);
 		struct bpf_link *link = bpf_program__attach_raw_tracepoint_opts(
-						skel->progs.wprof_ut_raw_tp,
+						progs->ut_raw_tp,
 						cfg->raw_tp.name, &opts);
 		if (!link) {
 			err = -errno;
@@ -2756,7 +3052,7 @@ static int attach_utrace_probe(struct bpf_state *st, struct wprof_bpf *skel,
 	}
 	case UTRACE_USDT: {
 		LIBBPF_OPTS(bpf_usdt_opts, opts, .usdt_cookie = *map_idx);
-		struct bpf_link *link = bpf_program__attach_usdt(skel->progs.wprof_ut_usdt,
+		struct bpf_link *link = bpf_program__attach_usdt(progs->ut_usdt,
 								 cfg_pid(cfg),
 								 cfg->usdt.attach_path,
 								 cfg->usdt.provider,
@@ -2781,39 +3077,93 @@ static int attach_utrace_probe(struct bpf_state *st, struct wprof_bpf *skel,
 	return 0;
 }
 
-int utrace_attach(struct bpf_state *st, struct wprof_bpf *skel)
+static int collect_funcs_to_find_in_dwarf(const struct utrace_session *sess, struct dwarf_infos *dwarfs)
 {
 	int err;
-	int map_fd = bpf_map__fd(skel->maps.utrace_probe_cfgs);
+
+	for (int i = 0; i < sess->cfg_cnt; i++) {
+		utrace_for_each_leg(leg, &sess->cfgs[i]) {
+			/*
+			 * KPROBE events can attach to inlined functions "calls" found in DWARF.
+			 * RETPROBEs and SPANs can't, as there is no clear "return" concept, but
+			 * still need DWARF for @file selectors and to report inlined copies.
+			 */
+			if (!cfg_is_kprobe_type(leg))
+				continue;
+			err = append_str_ref(&dwarfs->kprobe_func_names, &dwarfs->kprobe_func_name_cnt,
+					     leg->kprobe.name);
+			if (err)
+				return err;
+		}
+	}
+	return 0;
+}
+
+/*
+ * Attach resolved probes through the session's programs. With map_fd >= 0,
+ * each attached probe also gets its utrace_probe_cfg entry there, which its
+ * BPF cookie indexes.
+ */
+int utrace_attach_cfgs(struct bpf_state *st, struct utrace_session *sess, int map_fd)
+{
+	const struct utrace_progs *progs = &sess->progs;
+	struct dwarf_infos dwarfs = {};
+	int err = 0;
 	u32 map_idx = 0;
 
-	for (int i = 0; i < env.utrace_cfg_cnt; i++) {
-		struct utrace_cfg *cfg = &env.utrace_cfgs[i];
+	err = collect_funcs_to_find_in_dwarf(sess, &dwarfs);
+	if (err)
+		return err;
+
+	for (int i = 0; i < sess->cfg_cnt; i++) {
+		struct utrace_cfg *cfg = &sess->cfgs[i];
+		unsigned long *addrs = NULL, *exit_addrs = NULL;
+		size_t cnt = 0, exit_cnt = 0;
 
 		switch (cfg->type) {
 		case UTRACE_UPROBE:
 		case UTRACE_URETPROBE:
-		case UTRACE_KPROBE:
-		case UTRACE_KRETPROBE:
 		case UTRACE_BPF_PROBE:
 		case UTRACE_BPF_RETPROBE:
 		case UTRACE_USDT:
 		case UTRACE_RAW_TRACEPOINT:
 		case UTRACE_TRACEPOINT:
-			err = attach_utrace_probe(st, skel, cfg, i, UTRACE_INSTANT, false,
-						  cfg_is_ret_probe(cfg->type), map_fd, &map_idx);
+			err = attach_utrace_probe(st, progs, cfg, i, UTRACE_INSTANT, false,
+						  cfg_is_ret_probe(cfg->type), map_fd, &map_idx, NULL, 0);
+			if (err)
+				return err;
+			break;
+		case UTRACE_KPROBE:
+		case UTRACE_KRETPROBE:
+			err = resolve_kprobe_addrs(&dwarfs, cfg, &addrs, &cnt);
+			if (err)
+				return err;
+			err = attach_utrace_probe(st, progs, cfg, i, UTRACE_INSTANT, false,
+						  cfg_is_ret_probe(cfg->type), map_fd, &map_idx, addrs, cnt);
 			if (err)
 				return err;
 			break;
 		case UTRACE_UPROBE_SPAN:
-		case UTRACE_KPROBE_SPAN:
 		case UTRACE_BPF_SPAN:
-			err = attach_utrace_probe(st, skel, cfg, i, UTRACE_ENTRY, false,
-						  false, map_fd, &map_idx);
+			err = attach_utrace_probe(st, progs, cfg, i, UTRACE_ENTRY, false,
+						  false, map_fd, &map_idx, NULL, 0);
 			if (err)
 				return err;
-			err = attach_utrace_probe(st, skel, cfg, i, UTRACE_EXIT, true,
-						  true, map_fd, &map_idx);
+			err = attach_utrace_probe(st, progs, cfg, i, UTRACE_EXIT, true,
+						  true, map_fd, &map_idx, NULL, 0);
+			if (err)
+				return err;
+			break;
+		case UTRACE_KPROBE_SPAN:
+			err = resolve_kprobe_addrs(&dwarfs, cfg, &addrs, &cnt);
+			if (err)
+				return err;
+			err = attach_utrace_probe(st, progs, cfg, i, UTRACE_ENTRY, false,
+						  false, map_fd, &map_idx, addrs, cnt);
+			if (err)
+				return err;
+			err = attach_utrace_probe(st, progs, cfg, i, UTRACE_EXIT, true,
+						  true, map_fd, &map_idx, addrs, cnt);
 			if (err)
 				return err;
 			break;
@@ -2821,12 +3171,22 @@ int utrace_attach(struct bpf_state *st, struct wprof_bpf *skel)
 			struct utrace_cfg *entry = cfg->span.entry;
 			struct utrace_cfg *exit = cfg->span.exit;
 
-			err = attach_utrace_probe(st, skel, entry, i, UTRACE_ENTRY, false,
-						  cfg_is_ret_probe(entry->type), map_fd, &map_idx);
+			if (cfg_is_kprobe_type(entry)) {
+				err = resolve_kprobe_addrs(&dwarfs, entry, &addrs, &cnt);
+				if (err)
+					return err;
+			}
+			err = attach_utrace_probe(st, progs, entry, i, UTRACE_ENTRY, false,
+						  cfg_is_ret_probe(entry->type), map_fd, &map_idx, addrs, cnt);
 			if (err)
 				return err;
-			err = attach_utrace_probe(st, skel, exit, i, UTRACE_EXIT, true,
-						  cfg_is_ret_probe(exit->type), map_fd, &map_idx);
+			if (cfg_is_kprobe_type(exit)) {
+				err = resolve_kprobe_addrs(&dwarfs, exit, &exit_addrs, &exit_cnt);
+				if (err)
+					return err;
+			}
+			err = attach_utrace_probe(st, progs, exit, i, UTRACE_EXIT, true,
+						  cfg_is_ret_probe(exit->type), map_fd, &map_idx, exit_addrs, exit_cnt);
 			if (err)
 				return err;
 			break;
@@ -2835,7 +3195,15 @@ int utrace_attach(struct bpf_state *st, struct wprof_bpf *skel)
 			eprintf("utrace: probe type %d not yet supported\n", cfg->type);
 			return -EOPNOTSUPP;
 		}
+		free(addrs);
+		free(exit_addrs);
 	}
 
+	dwarf_infos_free(&dwarfs);
 	return 0;
+}
+
+int utrace_attach(struct bpf_state *st, struct wprof_bpf *skel)
+{
+	return utrace_attach_cfgs(st, env.utrace, bpf_map__fd(skel->maps.utrace_probe_cfgs));
 }

@@ -63,6 +63,7 @@
 #include "pystacks.h"
 #include "pysym.h"
 #include "utrace.h"
+#include "utrace_trigger.h"
 
 static int libbpf_print_fn(enum libbpf_print_level level, const char *format, va_list args)
 {
@@ -160,6 +161,7 @@ const char *extra_param_str(struct wprof_data_hdr *hdr, const struct wprof_extra
 	case WEXTRA_EMIT_PY_COMBINE:		return e->value ? "-e py-combine" : "-e no-py-combine";
 	case WEXTRA_PREPARE_SPEC:		return sfmt("--prepare %s", wevent_str(hdr, e->stroff));
 	case WEXTRA_ACTIVATE_SPEC:		return sfmt("--activate %s", wevent_str(hdr, e->stroff));
+	case WEXTRA_STOP_SPEC:			return sfmt("--stop %s", wevent_str(hdr, e->stroff));
 	case WEXTRA_STACK_CAPTURE:
 		switch (e->arg) {
 		case ST_TIMER:		return sfmt("--stacks=timer=%uhz", e->value);
@@ -202,6 +204,16 @@ static volatile bool exiting;
 
 static void sig_term(int sig)
 {
+	/* SIGINT goes to the trigger of the phase waiting for one, if any */
+	if (sig == SIGINT) {
+		int fd = __atomic_exchange_n(&env.sess_ctl.sigint_fd, -1, __ATOMIC_SEQ_CST);
+		if (fd >= 0) {
+			u64 v = 1;
+			(void)write(fd, &v, sizeof(v));
+			return;
+		}
+	}
+
 	exiting = true;
 	if (env.sess_ctl.sig_efd >= 0) {
 		u64 v = 1;
@@ -1582,7 +1594,7 @@ static int attach_bpf(struct bpf_state *st, struct worker_state *workers, int nu
 		}
 	}
 
-	if (env.utrace_cfg_cnt > 0) {
+	if (env.utrace->cfg_cnt > 0) {
 		err = utrace_attach(st, st->skel);
 		if (err) {
 			eprintf("Failed to attach utrace probes: %d\n", err);
@@ -1824,10 +1836,12 @@ static int do_prepare(struct bpf_state *bpf, struct worker_state *workers, int n
 	 * session end (the wait for activation plus the run duration), with margin.
 	 *
 	 * Flight recorder has no planned end (runs until Ctrl-C), so pass 0 to
-	 * disable the injectee watchdog.
+	 * disable the injectee watchdog. Same when it's not known yet when
+	 * activation happens. Injectees still clean up if wprof dies, once they
+	 * see their UDS closed.
 	 */
 	long sess_timeout_ms;
-	if (env.flightrec) {
+	if (env.flightrec || trigger_is_event(&env.activate_spec) || env.sess_ctl.activate_deferred) {
 		sess_timeout_ms = 0;
 	} else {
 		u64 activate_at = env.sess_ctl.activate_target_ts ?: ktime_now_ns();
@@ -1874,6 +1888,20 @@ static int do_activate(struct bpf_state *bpf)
 	env.sess_start_ts = env.ktime_start_ns;
 	/* flightrec runs until stopped: leave the end at 0 (gate treats 0 as no-end) */
 	env.sess_end_ts = env.flightrec ? 0 : env.ktime_start_ns + env.duration_ns;
+	/* a --stop time is just an earlier planned end, sharing the session end timer */
+	if (env.stop_spec.kind == TRIG_TIME) {
+		u64 stop_ts = resolve_timespec(&env.stop_spec.time, env.ktime_start_ns);
+
+		if (!ts_after(stop_ts, env.ktime_start_ns)) {
+			eprintf("Stop time (--stop) already passed before activation!\n");
+			return -EINVAL;
+		}
+		if (!env.sess_end_ts || ts_before(stop_ts, env.sess_end_ts)) {
+			env.sess_end_ts = stop_ts;
+			if (!env.flightrec) /* flightrec sets it from the kept window */
+				env.duration_ns = env.sess_end_ts - env.sess_start_ts;
+		}
+	}
 
 	bpf->skel->bss->session_start_ts = env.sess_start_ts;
 	bpf->skel->bss->session_end_ts = env.sess_end_ts;
@@ -1899,6 +1927,257 @@ static int do_activate(struct bpf_state *bpf)
 	return 0;
 }
 
+static int start_utrace_trigger(struct phase_trigger *t)
+{
+	int err;
+
+	err = utrace_trigger_start(t->spec->utrace_cfg, t->spec->str, &t->utrace_probe);
+	t->spec->utrace_cfg = NULL;
+	if (err)
+		eprintf("Failed to set up %s trigger '%s': %d\n", t->phase, t->spec->str, err);
+	return err;
+}
+
+/* Release a phase's trigger once its phase started, or at exit; closing its fd drops it from epoll */
+static int stop_trigger(struct phase_trigger *t)
+{
+	struct utrace_trigger *probe = t->utrace_probe;
+	int fd = t->fd;
+
+	t->utrace_probe = NULL;
+	t->fd = -1;
+
+	/* a utrace trigger's fd is its ringbuf's, closed as it detaches in the background */
+	if (probe)
+		return utrace_trigger_stop(probe);
+	if (fd < 0)
+		return 0;
+	/* still waiting for SIGINT: unpublish the eventfd, so the signal handler can't pick it up once closed */
+	if (t->spec->kind == TRIG_SIGINT) {
+		int published = fd;
+
+		__atomic_compare_exchange_n(&env.sess_ctl.sigint_fd, &published, -1, false,
+					    __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+	}
+	close(fd);
+	return 0;
+}
+
+/*
+ * Start a session phase's trigger when the phase before it begins: at startup
+ * for preparation, as preparation begins for activation.
+ */
+static int start_trigger(struct phase_trigger *t)
+{
+	int err;
+
+	switch (t->spec->kind) {
+	case TRIG_UNSET:
+	case TRIG_TIME:
+		t->fd = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK);
+		break;
+	case TRIG_SIGINT:
+		t->fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+		break;
+	case TRIG_UTRACE:
+		/* attached right away, its hits get latched in the ringbuf until the trigger is armed */
+		err = start_utrace_trigger(t);
+		if (err)
+			return err;
+		t->fd = utrace_trigger_fd(t->utrace_probe);
+		break;
+	default:
+		BUG("unhandled %s trigger kind %d\n", t->phase, t->spec->kind);
+	}
+	if (t->fd < 0) {
+		err = -errno;
+		eprintf("Failed to create %s trigger fd: %d\n", t->phase, err);
+		return err;
+	}
+	return 0;
+}
+
+/* Arm a session phase's trigger, once that phase is the next one to start. */
+static int arm_trigger(struct phase_trigger *t, u64 target_ts)
+{
+	int err;
+
+	/* stop requested (e.g., Ctrl-C during preparation), the control loop is about to wrap up */
+	if (exiting)
+		return 0;
+
+	/* a utrace hit latched since the trigger started makes its fd fire right away */
+	if (ctl_epoll_add(env.sess_ctl.epoll_fd, t->fd, t->tag)) {
+		err = -errno;
+		eprintf("Failed to register %s trigger fd: %d\n", t->phase, err);
+		return err;
+	}
+
+	switch (t->spec->kind) {
+	case TRIG_UNSET:
+	case TRIG_TIME:
+		if (arm_timer_abs(t->fd, target_ts ?: ktime_now_ns())) {
+			err = -errno;
+			eprintf("Failed to arm %s timer: %d\n", t->phase, err);
+			return err;
+		}
+		if (t->spec->kind == TRIG_TIME)
+			wprintf("Pending %s trigger...\n", t->phase);
+		break;
+	case TRIG_SIGINT:
+		__atomic_store_n(&env.sess_ctl.sigint_fd, t->fd, __ATOMIC_SEQ_CST);
+		wprintf("Pending %s trigger, press Ctrl-C (SIGINT) to proceed...\n", t->phase);
+		break;
+	case TRIG_UTRACE:
+		if (utrace_trigger_hit_cnt(t->utrace_probe)) {
+			wprintf("Pending %s trigger '%s' already got hit, proceeding right away...\n",
+				t->phase, t->spec->str);
+		} else {
+			wprintf("Pending %s trigger '%s'...\n", t->phase, t->spec->str);
+		}
+		break;
+	default:
+		BUG("unhandled %s trigger kind %d\n", t->phase, t->spec->kind);
+	}
+	return 0;
+}
+
+/* Consume a session phase's ready trigger fd: 1 if the trigger fired, 0 if not (yet), <0 on error. */
+static int consume_trigger(struct phase_trigger *t)
+{
+	switch (t->spec->kind) {
+	case TRIG_UNSET:
+	case TRIG_TIME:
+		drain_fd(t->fd);
+		return 1;
+	case TRIG_SIGINT:
+		drain_fd(t->fd);
+		wprintf("SIGINT triggered %s.\n", t->phase);
+		return 1;
+	case TRIG_UTRACE: {
+		struct utrace_trigger_hit hit;
+		int err;
+
+		err = utrace_trigger_poll(t->utrace_probe, &hit);
+		if (err < 0) {
+			eprintf("Failed to poll %s trigger '%s': %d\n", t->phase, t->spec->str, err);
+			return err;
+		}
+		if (err == 0)
+			return 0;
+
+		wprintf("'%s' triggered %s: PID %u, TID %u (%s), CPU %u.\n",
+			t->spec->str, t->phase, hit.pid, hit.tid, hit.comm, hit.cpu);
+		return 1;
+	}
+	default:
+		BUG("unhandled %s trigger kind %d\n", t->phase, t->spec->kind);
+	}
+}
+
+/* SESS_STANDBY -> SESS_ARMED */
+static int on_prepare_trigger(struct bpf_state *bpf, struct worker_state *workers, int num_cpus, int workdir_fd)
+{
+	struct timespec_spec *act_time = &env.activate_spec.time;
+	int err;
+
+	/* after an event-triggered prepare, +<dur> activation counts from the trigger... */
+	if (env.sess_ctl.activate_deferred && act_time->kind == TS_REL) {
+		env.sess_ctl.activate_target_ts = resolve_timespec(act_time, ktime_now_ns());
+		env.sess_ctl.activate_deferred = false;
+	}
+
+	err = stop_trigger(&env.sess_ctl.prep_trig);
+	if (err)
+		return err;
+
+	env.sess_ctl.state = SESS_PREP;
+
+	err = start_trigger(&env.sess_ctl.activate_trig);
+	if (err)
+		return err;
+
+	err = do_prepare(bpf, workers, num_cpus, workdir_fd);
+	if (err)
+		return err;
+
+	/* ...and /<dur> activation picks the first period boundary after preparation */
+	if (env.sess_ctl.activate_deferred && act_time->kind == TS_ALIGN) {
+		env.sess_ctl.activate_target_ts = resolve_timespec(act_time, ktime_now_ns());
+		env.sess_ctl.activate_deferred = false;
+	}
+
+	env.sess_ctl.state = SESS_ARMED;
+	if (env.sess_ctl.activate_target_ts && ts_before(env.sess_ctl.activate_target_ts, ktime_now_ns())) {
+		eprintf("Activation time (--activate) already passed during preparation!\n");
+		return -EINVAL;
+	}
+	return arm_trigger(&env.sess_ctl.activate_trig, env.sess_ctl.activate_target_ts);
+}
+
+/* --stop event trigger starts and gets armed along with recording */
+static int start_stop_trigger(void)
+{
+	struct phase_trigger *t = &env.sess_ctl.stop_trig;
+	int err;
+
+	switch (t->spec->kind) {
+	case TRIG_UNSET:
+	case TRIG_TIME: /* folded into the session end by do_activate() */
+		return 0;
+	case TRIG_SIGINT:
+	case TRIG_UTRACE:
+		break;
+	default:
+		BUG("unhandled --stop trigger kind %d\n", t->spec->kind);
+	}
+
+	err = start_trigger(t);
+	if (err)
+		return err;
+	return arm_trigger(t, 0);
+}
+
+/* SESS_ARMED -> SESS_RECORDING */
+static int on_activate_trigger(struct bpf_state *bpf)
+{
+	int err;
+
+	err = do_activate(bpf);
+	if (err)
+		return err;
+
+	/* release the activation trigger only after the latency-sensitive activation */
+	err = stop_trigger(&env.sess_ctl.activate_trig);
+	if (err)
+		return err;
+
+	env.sess_ctl.session_activated = true;
+	env.sess_ctl.state = SESS_RECORDING;
+	/* no planned end (flightrec without a --stop time): run until stopped */
+	if (env.sess_end_ts) {
+		env.sess_ctl.sess_end_target_ts = env.sess_end_ts;
+		arm_timer_abs(env.sess_ctl.sess_end_tfd, env.sess_ctl.sess_end_target_ts);
+	}
+
+	err = start_stop_trigger();
+	if (err)
+		return err;
+	/*
+	 * Watch each active injectee's UDS: an EOF means it died
+	 * mid-session (handled by the control loop), and later this carries
+	 * the chunk-handoff protocol. Only synchronous UDS traffic happens
+	 * before this point and after the loop exits, so the single
+	 * epoll reader never races those.
+	 */
+	for (int j = 0; j < env.injectee_cnt; j++) {
+		struct injectee *inj = &env.injectees[j];
+		if (inj->state == INJECTEE_ACTIVE && inj->uds_fd >= 0)
+			ctl_epoll_add(env.sess_ctl.epoll_fd, inj->uds_fd, CTLS_INJECTEE_UDS_BASE + j);
+	}
+	return 0;
+}
+
 int main(int argc, char **argv)
 {
 	struct bpf_state bpf_state = {};
@@ -1912,9 +2191,22 @@ int main(int argc, char **argv)
 	calibrate_ktime(); /* establish the ktime<->realtime mapping up front, so it is always available */
 	elf_init(); /* set libelf's version up front so concurrent ELF parsing can't race on it */
 	env.sess_ctl.sig_efd = -1; /* so an early SIGINT (before the eventfd exists) is a no-op */
+	env.sess_ctl.sigint_fd = -1; /* no phase waits for SIGINT yet */
+	/* trigger fds get created later, but cleanup may come first */
+	env.sess_ctl.prep_trig = (struct phase_trigger){
+		.phase = "preparation", .spec = &env.prepare_spec, .tag = CTL_PREP_TRIGGER, .fd = -1,
+	};
+	env.sess_ctl.activate_trig = (struct phase_trigger){
+		.phase = "activation", .spec = &env.activate_spec, .tag = CTL_ACTIVATE_TRIGGER, .fd = -1,
+	};
+	env.sess_ctl.stop_trig = (struct phase_trigger){
+		.phase = "stop", .spec = &env.stop_spec, .tag = CTL_STOP_TRIGGER, .fd = -1,
+	};
 
 	/* Parse command line arguments */
 	setenv("ARGP_HELP_FMT", "opt-doc-col=35,rmargin=150", 0); /* widen default --help output */
+	env.utrace = calloc(1, sizeof(*env.utrace));
+
 	err = argp_parse(&argp, argc, argv, 0, NULL, NULL);
 	if (err) {
 		err = -1;
@@ -1953,7 +2245,14 @@ int main(int argc, char **argv)
 		goto cleanup;
 	}
 
-	if (env.replay && env.utrace_cfg_cnt > 0) {
+	/* -d is the time limit in case --stop never fires, so it has to be explicit */
+	if (env.stop_spec.kind != TRIG_UNSET && !env.flightrec && env.duration_ns == 0) {
+		eprintf("--stop requires -d as a time limit, unless in flight recorder mode (-F)!\n");
+		err = -EINVAL;
+		goto cleanup;
+	}
+
+	if (env.replay && env.utrace->cfg_cnt > 0) {
 		eprintf("--utrace (-U) is capture-time only and can't be used in replay mode (-R)!\n");
 		err = -EINVAL;
 		goto cleanup;
@@ -2361,7 +2660,7 @@ int main(int argc, char **argv)
 			case WEXTRA_UTRACE_DEF:
 				err = ucfg_parse(val);
 				if (!err)
-					err = ucfg_compile_tmpls(&env.utrace_cfgs[env.utrace_cfg_cnt - 1]);
+					err = ucfg_compile_tmpls(&env.utrace->cfgs[env.utrace->cfg_cnt - 1]);
 				break;
 			/*
 			 * Emit (-e) options keep their CLI value if set, otherwise
@@ -2414,6 +2713,7 @@ int main(int argc, char **argv)
 			case WEXTRA_PMU:
 			case WEXTRA_PREPARE_SPEC:
 			case WEXTRA_ACTIVATE_SPEC:
+			case WEXTRA_STOP_SPEC:
 			case WEXTRA_FR_SPEC:
 			case WEXTRA_STACK_CAPTURE:
 				/* capture-time only; informational at replay (see cmdline reconstruction) */
@@ -2755,12 +3055,10 @@ int main(int argc, char **argv)
 		goto cleanup;
 	}
 
-	env.sess_ctl.prep_tfd     = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK);
-	env.sess_ctl.activate_tfd = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK);
 	env.sess_ctl.sess_end_tfd = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK);
-	if (env.sess_ctl.prep_tfd < 0 || env.sess_ctl.activate_tfd < 0 || env.sess_ctl.sess_end_tfd < 0) {
+	if (env.sess_ctl.sess_end_tfd < 0) {
 		err = -errno;
-		eprintf("Failed to create session timerfds: %d\n", err);
+		eprintf("Failed to create session end timerfd: %d\n", err);
 		goto cleanup;
 	}
 
@@ -2771,9 +3069,7 @@ int main(int argc, char **argv)
 		goto cleanup;
 	}
 
-	if (ctl_epoll_add(env.sess_ctl.epoll_fd, env.sess_ctl.prep_tfd, CTL_PREP_TIMER) ||
-	    ctl_epoll_add(env.sess_ctl.epoll_fd, env.sess_ctl.activate_tfd, CTL_ACTIVATE_TIMER) ||
-	    ctl_epoll_add(env.sess_ctl.epoll_fd, env.sess_ctl.sess_end_tfd, CTL_END_TIMER) ||
+	if (ctl_epoll_add(env.sess_ctl.epoll_fd, env.sess_ctl.sess_end_tfd, CTL_END_TIMER) ||
 	    ctl_epoll_add(env.sess_ctl.epoll_fd, env.sess_ctl.sig_efd, CTL_SIGNAL)) {
 		err = -errno;
 		eprintf("Failed to register session control fds: %d\n", err);
@@ -2785,21 +3081,69 @@ int main(int argc, char **argv)
 	 * targets; a zero target means "immediately" (prepare at startup, activate
 	 * as soon as prepare finishes).
 	 */
-	if (env.prepare_spec.kind) {
-		env.sess_ctl.prepare_target_ts = resolve_timespec(&env.prepare_spec, env.actual_start_ts);
+	switch (env.prepare_spec.kind) {
+	case TRIG_UNSET:
+	case TRIG_SIGINT:
+	case TRIG_UTRACE:
+		break;
+	case TRIG_TIME:
+		env.sess_ctl.prepare_target_ts = resolve_timespec(&env.prepare_spec.time, env.actual_start_ts);
 		if (env.sess_ctl.prepare_target_ts && ts_before(env.sess_ctl.prepare_target_ts, ktime_now_ns())) {
 			eprintf("Preparation time (--prepare) is in the past!\n");
 			err = -EINVAL;
 			goto cleanup;
 		}
+		break;
+	default:
+		BUG("unhandled --prepare trigger kind %d\n", env.prepare_spec.kind);
 	}
-	if (env.activate_spec.kind) {
-		env.sess_ctl.activate_target_ts = resolve_timespec(&env.activate_spec, env.actual_start_ts);
+	switch (env.activate_spec.kind) {
+	case TRIG_UNSET:
+	case TRIG_SIGINT:
+	case TRIG_UTRACE:
+		break;
+	case TRIG_TIME:
+		/* with an event-triggered prepare, +<dur> and /<dur> get resolved once that event fires */
+		if (trigger_is_event(&env.prepare_spec) &&
+		    (env.activate_spec.time.kind == TS_REL || env.activate_spec.time.kind == TS_ALIGN)) {
+			env.sess_ctl.activate_deferred = true;
+			break;
+		}
+		env.sess_ctl.activate_target_ts = resolve_timespec(&env.activate_spec.time, env.actual_start_ts);
 		if (env.sess_ctl.activate_target_ts && ts_before(env.sess_ctl.activate_target_ts, ktime_now_ns())) {
 			eprintf("Activation time (--activate) is in the past!\n");
 			err = -EINVAL;
 			goto cleanup;
 		}
+		break;
+	default:
+		BUG("unhandled --activate trigger kind %d\n", env.activate_spec.kind);
+	}
+	switch (env.stop_spec.kind) {
+	case TRIG_UNSET:
+	case TRIG_SIGINT:
+	case TRIG_UTRACE:
+		break;
+	case TRIG_TIME: {
+		/* relative and aligned times resolve at activation, an absolute one can be checked already */
+		u64 stop_ts = resolve_timespec(&env.stop_spec.time, env.actual_start_ts);
+
+		if (env.stop_spec.time.kind != TS_ABS)
+			break;
+		if (ts_before(stop_ts, ktime_now_ns())) {
+			eprintf("Stop time (--stop) is in the past!\n");
+			err = -EINVAL;
+			goto cleanup;
+		}
+		if (env.sess_ctl.activate_target_ts && ts_before(stop_ts, env.sess_ctl.activate_target_ts)) {
+			eprintf("Stop time (--stop) is before activation time (--activate)!\n");
+			err = -EINVAL;
+			goto cleanup;
+		}
+		break;
+	}
+	default:
+		BUG("unhandled --stop trigger kind %d\n", env.stop_spec.kind);
 	}
 	if (env.sess_ctl.prepare_target_ts && env.sess_ctl.activate_target_ts &&
 	    ts_before(env.sess_ctl.activate_target_ts, env.sess_ctl.prepare_target_ts)) {
@@ -2808,9 +3152,13 @@ int main(int argc, char **argv)
 		goto cleanup;
 	}
 
-	arm_timer_abs(env.sess_ctl.prep_tfd, env.sess_ctl.prepare_target_ts ?: ktime_now_ns());
-	if (env.prepare_spec.kind)
-		wprintf("Pending preparation trigger...\n");
+	/* nothing comes before preparation, so its trigger starts right away */
+	err = start_trigger(&env.sess_ctl.prep_trig);
+	if (err)
+		goto cleanup;
+	err = arm_trigger(&env.sess_ctl.prep_trig, env.sess_ctl.prepare_target_ts);
+	if (err)
+		goto cleanup;
 
 	while (env.sess_ctl.state != SESS_DONE) {
 		struct epoll_event evs[8];
@@ -2830,47 +3178,38 @@ int main(int argc, char **argv)
 				drain_fd(env.sess_ctl.sig_efd);
 				env.sess_ctl.state = SESS_DONE;
 				break;
-			case CTL_PREP_TIMER:
-				drain_fd(env.sess_ctl.prep_tfd);
-				env.sess_ctl.state = SESS_PREP;
-				err = do_prepare(&bpf_state, workers, num_cpus, workdir_fd);
+			case CTL_PREP_TRIGGER:
+				err = consume_trigger(&env.sess_ctl.prep_trig);
+				if (err < 0)
+					goto cleanup;
+				if (err == 0) /* not fired (yet) */
+					break;
+				err = on_prepare_trigger(&bpf_state, workers, num_cpus, workdir_fd);
 				if (err)
 					goto cleanup;
-				env.sess_ctl.state = SESS_ARMED;
-				if (env.sess_ctl.activate_target_ts &&
-				    ts_before(env.sess_ctl.activate_target_ts, ktime_now_ns())) {
-					eprintf("Activation time (--activate) already passed during preparation!\n");
-					err = -EINVAL;
-					goto cleanup;
-				}
-				arm_timer_abs(env.sess_ctl.activate_tfd, env.sess_ctl.activate_target_ts ?: ktime_now_ns());
-				if (env.activate_spec.kind)
-					wprintf("Pending activation trigger...\n");
 				break;
-			case CTL_ACTIVATE_TIMER:
-				drain_fd(env.sess_ctl.activate_tfd);
-				err = do_activate(&bpf_state);
+			case CTL_ACTIVATE_TRIGGER:
+				err = consume_trigger(&env.sess_ctl.activate_trig);
+				if (err < 0)
+					goto cleanup;
+				if (err == 0) /* not fired (yet) */
+					break;
+				err = on_activate_trigger(&bpf_state);
 				if (err)
 					goto cleanup;
-				env.sess_ctl.session_activated = true;
-				env.sess_ctl.state = SESS_RECORDING;
-				/* flightrec has no planned end: run until stopped (Ctrl-C via CTL_SIGNAL) */
-				if (!env.flightrec) {
-					env.sess_ctl.sess_end_target_ts = env.sess_end_ts;
-					arm_timer_abs(env.sess_ctl.sess_end_tfd, env.sess_ctl.sess_end_target_ts);
-				}
-				/*
-				 * Watch each active injectee's UDS: an EOF means it died
-				 * mid-session (handled below), and later this carries the
-				 * chunk-handoff protocol. Only synchronous UDS traffic happens
-				 * before this point and after the loop exits, so the single
-				 * epoll reader never races those.
-				 */
-				for (int j = 0; j < env.injectee_cnt; j++) {
-					struct injectee *inj = &env.injectees[j];
-					if (inj->state == INJECTEE_ACTIVE && inj->uds_fd >= 0)
-						ctl_epoll_add(env.sess_ctl.epoll_fd, inj->uds_fd, CTLS_INJECTEE_UDS_BASE + j);
-				}
+				break;
+			case CTL_STOP_TRIGGER:
+				err = consume_trigger(&env.sess_ctl.stop_trig);
+				if (err < 0)
+					goto cleanup;
+				if (err == 0) /* not fired (yet) */
+					break;
+				/* cut short like Ctrl-C, the recorded window gets clamped below */
+				env.sess_ctl.stopped_ts = ktime_now_ns();
+				env.sess_ctl.state = SESS_DONE;
+				err = stop_trigger(&env.sess_ctl.stop_trig);
+				if (err)
+					goto cleanup;
 				break;
 			case CTL_END_TIMER:
 				drain_fd(env.sess_ctl.sess_end_tfd);
@@ -2905,15 +3244,17 @@ int main(int argc, char **argv)
 	}
 
 	/*
-	 * If the session was cut short (signal) rather than reaching its planned
-	 * end, clamp the recorded window to now. This is the point past which the
-	 * various data sources (BPF ringbufs, CUDA/pytrace tracee dumps) are torn
-	 * down at staggered times and can no longer be considered mutually
-	 * consistent. When the session-end timerfd fires it signals the planned
-	 * end, which already carries the correct session end.
+	 * If the session was cut short (signal, --stop trigger) rather than
+	 * reaching its planned end, clamp the recorded window to now. This is the
+	 * point past which the various data sources (BPF ringbufs, CUDA/pytrace
+	 * tracee dumps) are torn down at staggered times and can no longer be
+	 * considered mutually consistent. A --stop trigger clamps it to when the
+	 * trigger fired instead, which comes before that. When the session-end
+	 * timerfd fires it signals the planned end, which already carries the
+	 * correct session end.
 	 */
 	if (!env.sess_ctl.session_complete) {
-		env.sess_end_ts = ktime_now_ns();
+		env.sess_end_ts = env.sess_ctl.stopped_ts ?: ktime_now_ns();
 		env.duration_ns = env.sess_end_ts - env.sess_start_ts;
 		/*
 		 * flightrec ran with no in-kernel end (0); push the stop time into
@@ -3114,6 +3455,9 @@ cleanup:
 	 * On the normal success fall-through these all re-run harmlessly as
 	 * no-ops (workers already joined, ringbufs drained, `fr` already NULL).
 	 */
+	stop_trigger(&env.sess_ctl.prep_trig);
+	stop_trigger(&env.sess_ctl.activate_trig);
+	stop_trigger(&env.sess_ctl.stop_trig);
 	stop_rb_workers(&bpf_state);
 	detach_bpf(&bpf_state, num_cpus);
 	drain_bpf(&bpf_state, num_cpus);

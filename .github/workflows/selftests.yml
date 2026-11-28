@@ -1,0 +1,194 @@
+name: selftests
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    outputs:
+      tags: ${{ steps.inputs.outputs.tags }}
+      base: ${{ steps.inputs.outputs.base }}
+      image-key: ${{ steps.inputs.outputs.image-key }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Resolve tools image and list kernel tags
+        id: inputs
+        env:
+          BUILD_HASH: ${{ hashFiles('test/ci/Dockerfile', 'test/ci/build-container.sh') }}
+        run: |
+          if ! command -v skopeo >/dev/null; then
+              sudo apt-get update
+              sudo apt-get install -y skopeo
+          fi
+          base=$(sed -n 's/^ARG BASE_IMAGE=//p' test/ci/Dockerfile)
+          digest=$(skopeo inspect --raw "docker://$base" | sha256sum | cut -d' ' -f1)
+          tags=$(make -s --no-print-directory -C test list-kernel-tags | jq -Rn -c '[inputs]')
+          {
+              echo "base=$base@sha256:$digest"
+              echo "image-key=wprof-tools-v1-$RUNNER_ARCH-$digest-$BUILD_HASH"
+              echo "tags=$tags"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Look up tools image
+        id: image
+        uses: actions/cache/restore@v5
+        with:
+          path: ${{ runner.temp }}/wprof-tools.tar
+          key: ${{ steps.inputs.outputs.image-key }}
+          lookup-only: true
+
+      - name: Build and export tools image
+        if: steps.image.outputs.cache-hit != 'true'
+        env:
+          BASE_REF: ${{ steps.inputs.outputs.base }}
+        run: |
+          printf 'BASE_IMAGE=%q\n' "$BASE_REF" > "$RUNNER_TEMP/wprof-config"
+          WPROF_TEST_CONFIG="$RUNNER_TEMP/wprof-config" ./test/ci/build-container.sh
+          podman save --format oci-archive -o "$RUNNER_TEMP/wprof-tools.tar" localhost/wprof-selftests:ci
+
+      - name: Cache tools image
+        if: steps.image.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: ${{ runner.temp }}/wprof-tools.tar
+          key: ${{ steps.inputs.outputs.image-key }}
+
+  selftests:
+    name: Selftests (${{ matrix.tag }})
+    needs: prepare
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        tag: ${{ fromJSON(needs.prepare.outputs.tags) }}
+    env:
+      KERNEL_TAG: ${{ matrix.tag }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Restore tools image
+        id: image
+        uses: actions/cache/restore@v5
+        with:
+          path: ${{ runner.temp }}/wprof-tools.tar
+          key: ${{ needs.prepare.outputs.image-key }}
+
+      - name: Load tools image
+        if: steps.image.outputs.cache-hit == 'true'
+        run: |
+          podman load -i "$RUNNER_TEMP/wprof-tools.tar"
+          rm -- "$RUNNER_TEMP/wprof-tools.tar"
+
+      - name: Build tools image if the cache entry is unavailable
+        if: steps.image.outputs.cache-hit != 'true'
+        env:
+          BASE_REF: ${{ needs.prepare.outputs.base }}
+        run: |
+          printf 'BASE_IMAGE=%q\n' "$BASE_REF" > "$RUNNER_TEMP/wprof-config"
+          WPROF_TEST_CONFIG="$RUNNER_TEMP/wprof-config" ./test/ci/build-container.sh
+
+      - name: Check KVM access inside Podman
+        run: |
+          sudo chmod 0666 /dev/kvm
+          ./test/ci/with-ci-env.sh sh -c 'exec 3<>/dev/kvm'
+
+      - name: Get kernel bundle cache key
+        id: kernel
+        run: |
+          hash=$(./test/ci/with-ci-env.sh make -s --no-print-directory -C test "kernel-key-$KERNEL_TAG")
+          echo "key=wprof-kernel-v1-$RUNNER_ARCH-$KERNEL_TAG-$hash" >> "$GITHUB_OUTPUT"
+          echo "path=${XDG_CACHE_HOME:-$HOME/.cache}/wprof-selftests/bundles/$KERNEL_TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Restore kernel bundle
+        id: bundle
+        uses: actions/cache/restore@v5
+        with:
+          key: ${{ steps.kernel.outputs.key }}
+          path: ${{ steps.kernel.outputs.path }}
+
+      - name: Build kernel
+        run: ./test/ci/with-ci-env.sh make -C test "kernel-$KERNEL_TAG" KERNEL_JOBS="$(nproc)"
+
+      - name: Cache kernel bundle
+        if: steps.bundle.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          key: ${{ steps.kernel.outputs.key }}
+          path: ${{ steps.kernel.outputs.path }}
+
+      - name: Get Rust cache keys
+        id: rust-keys
+        env:
+          DEPS_HASH: ${{ hashFiles('src/*/Cargo.toml', 'src/*/Cargo.lock') }}
+        run: |
+          image=$(./test/ci/with-ci-env.sh printenv WPROF_IMAGE_ID)
+          revision=$(git rev-parse HEAD:blazesym)
+          echo "blazesym=wprof-blazesym-v1-$image-$revision" >> "$GITHUB_OUTPUT"
+          echo "deps=wprof-rust-deps-v1-$image-$DEPS_HASH" >> "$GITHUB_OUTPUT"
+
+      - name: Cache blazesym build
+        uses: actions/cache@v5
+        with:
+          path: blazesym/target
+          key: ${{ steps.rust-keys.outputs.blazesym }}-${{ hashFiles('src/Makefile') }}
+
+      - name: Restore in-tree Rust dependencies
+        id: rust-deps
+        uses: actions/cache/restore@v5
+        with:
+          path: src/*/target
+          key: ${{ steps.rust-keys.outputs.deps }}
+
+      - name: Build in-tree Rust dependencies
+        if: steps.rust-deps.outputs.cache-hit != 'true'
+        run: |
+          ci=./test/ci/with-ci-env.sh
+          for manifest in src/*/Cargo.toml; do
+              # `cargo tree` command prints out crate dependencies as "<depth> <dep> <version>":
+              #   0 wpb-c v0.1.0 (/.../src/wpb)
+              #   1 prost v0.14.3
+              #   1 rustc-hash v2.1.2
+              "$ci" cargo tree --manifest-path "$manifest" --locked --depth 1 --edges normal --prefix depth --format ' {p}' |
+                  # For each first level dependency extract a string like `-p prost@0.14.3`.
+                  awk '$1 == 1 { print "-p", $2 "@" substr($3, 2) }' |
+                  # Ask cargo to build the depdendencies; xargs -r skips build command if deps list is empty.
+                  xargs -r "$ci" cargo build --manifest-path "$manifest" --locked --release --lib
+          done
+
+      - name: Cache in-tree Rust dependencies
+        if: steps.rust-deps.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: src/*/target
+          key: ${{ steps.rust-keys.outputs.deps }}
+
+      - name: Build wprof
+        run: ./test/ci/with-ci-env.sh make -C test wprof
+
+      - name: Run selftests
+        run: ./test/ci/with-ci-env.sh python3 -B test/selftests.py --kernel "@$KERNEL_TAG" --no-hugetlb --vms 2
+
+      - name: Upload test results
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: selftests-${{ matrix.tag }}
+          path: /tmp/wprof-selftests-current/
+          if-no-files-found: ignore
